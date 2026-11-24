@@ -38,6 +38,23 @@ static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
 static std::atomic<bool> g_want_fullscreen_apply{false};
 
+// the progress panel (menu_set_progress): written by the preparing thread, drawn by menu_render
+static pthread_mutex_t g_prog_lock = PTHREAD_MUTEX_INITIALIZER;
+static char g_prog_title[160], g_prog_detail[320];
+static float g_prog_fraction = -1;
+static std::atomic<bool> g_prog_on{false}, g_prog_skip{false};
+
+void menu_set_progress(const char *title, const char *detail, float fraction) {
+    pthread_mutex_lock(&g_prog_lock);
+    snprintf(g_prog_title, sizeof g_prog_title, "%s", title ? title : "");
+    snprintf(g_prog_detail, sizeof g_prog_detail, "%s", detail ? detail : "");
+    g_prog_fraction = fraction;
+    pthread_mutex_unlock(&g_prog_lock);
+    if (title && !g_prog_on.load()) g_prog_skip = false;
+    g_prog_on = title != NULL;
+}
+bool menu_progress_skipped(void) { return g_prog_skip.load(); }
+
 struct QEvent {
     enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT } kind;
     ImGuiKey key;
@@ -144,6 +161,13 @@ extern "C" bool menu_input_captured(void) { return capturing(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
+    if (g_prog_on.load()) {  // (the progress panel: Esc / B / Back skip it; nothing else reaches the menu meanwhile)
+        if ((e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && e->key.scancode == SDL_SCANCODE_ESCAPE) ||
+            (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+             (e->gbutton.button == SDL_GAMEPAD_BUTTON_EAST || e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK)))
+            g_prog_skip = true;
+        return e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+    }
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
@@ -802,7 +826,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     bool open = g_open.load();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !g_settings.show_fps && !touch_visible()) {
+    bool prog = g_prog_on.load();
+    if (!open && !kbd && !prog && !g_settings.show_fps && !touch_visible()) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -853,6 +878,32 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::Text("%.0f fps", io.Framerate);
+        ImGui::End();
+    }
+
+    if (prog) {
+        char title[160], detail[320];
+        float fraction;
+        pthread_mutex_lock(&g_prog_lock);
+        memcpy(title, g_prog_title, sizeof title);
+        memcpy(detail, g_prog_detail, sizeof detail);
+        fraction = g_prog_fraction;
+        pthread_mutex_unlock(&g_prog_lock);
+        float w = fminf(io.DisplaySize.x * 0.8f, 1100 * scale);
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
+        ImGui::Begin("##progress", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", title);
+        ImGui::Spacing();
+        ImGui::TextWrapped("%s", detail);
+        if (fraction >= 0) {
+            char pct[16];
+            snprintf(pct, sizeof pct, "%.0f%%", fraction * 100);
+            ImGui::ProgressBar(fraction, ImVec2(-1, 0), pct);
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("Esc / B: play now (shaders are then built while you play)");
         ImGui::End();
     }
 

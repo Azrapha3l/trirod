@@ -48,6 +48,9 @@ implementado mas nunca foi testado contra uma release publicada; não o descreva
   draw/textura) usa `LOG_VERBOSE`; comando de serviço sem implementação usa `LOG_FIRST` (`runtime/log.c`). Não
   colocar chamadas com efeito colateral nos argumentos de `LOG_VERBOSE` (não são avaliados fora do modo verbose).
   O launcher e o `Trirod.exe` não abrem console; `--console` / `EOWRECOMP_CONSOLE=1` abre (`docs/RELEASE-WORKFLOW.md`).
+- Vulkan GPL (`VK_EXT_graphics_pipeline_library`, `exec.c`): bibliotecas só são ligadas com fast link; o pipeline otimizado é o
+  pipeline completo (link com LINK_TIME_OPTIMIZATION sem RETAIN deixou a tela preta; com RETAIN o cache foi a 1,2 GB). Mudança de pipeline/GPL: testar com `EOWRECOMP_VK_VALIDATION=1` e
+  comparar com `EOWRECOMP_VK_GPL=0`; mudança que invalide caches antigos sobe `PIPELINE_SCHEME` (`device.c`).
 
 ## Verificação
 - Uma correção só está verificada depois de vista funcionando (screenshot, log ou teste) — nunca declarar

@@ -4,16 +4,21 @@
 // (runtime/nvn/maxwell/translate.c), compiles with its shaderc path and creates pipelines on the device the game
 // will choose, into the same caches (<data root>/cache):
 //
-//  1. Recorded recipes (exec.c vk_warm_start): every program and pipeline that earlier game sessions on this GPU
-//     built, re-translated from their cached guest code and created with their recorded render state. These are
-//     complete pipelines; the driver's pipeline cache (vk_pipelines.bin) keeps them for the next start.
+//  1. Recorded recipes (exec.c vk_warm_start): local gameplay captures plus the packaged portable warm catalog.
+//     Guest code is re-translated and compatible pipelines are rebuilt from their recorded render state. The shared
+//     code and recipes are merged into the player's data cache; the driver's vk_pipelines.bin stays local.
 //  2. The portable shader catalog (extracted/shader_catalog, from the game's BNSH archives: trbuild files): each
-//     vertex+fragment pair and each compute shader translated to GLSL and compiled to SPIR-V into <cache>/spirv. The
-//     archives carry the shader code but not the draw state a pipeline needs (vertex formats, render-target formats,
-//     blend / depth state) nor the runtime ShaderKey of each draw, so no pipelines are created from them. Pairs are
-//     translated with the key a plain draw uses (float vertex inputs and colour targets, and the game's window-origin
-//     / depth-mode flags as the recipes recorded them); a draw whose key differs translates again in game. Compute
-//     shaders have a single key ({glsl}), so theirs match the runtime exactly.
+//     vertex+fragment pair and each compute shader translated to GLSL and compiled to SPIR-V into <cache>/spirv.
+//     When VK_EXT_graphics_pipeline_library is available, setup also creates reusable shader-stage libraries for each
+//     graphics pair. At runtime those are linked with small vertex-input and render-target libraries. The archives do
+//     not contain vertex formats or target/blend state, so they cannot produce complete draw pipelines by themselves.
+//     Pairs use the key a plain draw uses; a draw whose ShaderKey differs translates again in game.
+//  3. With graphics pipeline libraries, each recipe pipeline is fast-linked first and an optimized (complete)
+//     replacement is built in the background; the cache is saved once those have finished, so the game's own
+//     replacements are found in the driver's cache.
+// The launcher shows one percentage over all of it, with completed / total counts per phase (report_progress). The
+// cache is tagged with the device, driver and pipeline scheme (device.c pipeline_cache_check); the game ignores a
+// cache prepared for another GPU or driver and leaves cache/shaders-stale.txt for the launcher's "Prepare shaders".
 //
 // Anything not prepared here is built by the runtime when first drawn, as before (a draw waits or is skipped while
 // it builds: exec.c compile_wait). The GPU caches stay on this PC: they are specific to the device and driver.
@@ -148,7 +153,10 @@ static uint32_t catalog_prog_stage(const Catalog *c, uint32_t p, int s) {
 typedef struct { uint32_t vs, ps; } Job;  // ps == CAT_NONE: a compute shader (vs = its stage)
 static Job *g_jobs;
 static int g_njobs;
-static atomic_int g_next, g_done, g_ok, g_translate_failed, g_spirv_failed;
+// g_translated: catalog jobs whose Maxwell -> GLSL translation finished (or failed); g_lib_done: graphics pairs whose
+// shader-stage library step finished (created, failed, or nothing to build after a failed translation / SPIR-V)
+static atomic_int g_next, g_done, g_ok, g_translate_failed, g_spirv_failed, g_gpl_pairs, g_gpl_failed, g_translated,
+    g_lib_done;
 static ShaderKey g_vkey, g_fkey;
 static Catalog g_cat;
 static pthread_mutex_t g_translate_lock = PTHREAD_MUTEX_INITIALIZER;  // (the translator keeps global state)
@@ -199,6 +207,7 @@ static void *translate_worker(void *arg) {
             pthread_mutex_lock(&g_translate_lock);
             ShaderInfo *si = vc ? maxwell_translate(vc, vlen, STAGE_COMPUTE, &k) : NULL;
             pthread_mutex_unlock(&g_translate_lock);
+            atomic_fetch_add(&g_translated, 1);
             if (!si || !si->msl) atomic_fetch_add(&g_translate_failed, 1), note_failure("cs", si, vc, vlen);
             else if (!(ok = spirv(si->msl, STAGE_COMPUTE, "cs"))) atomic_fetch_add(&g_spirv_failed, 1);
             if (si) maxwell_free(si);
@@ -212,14 +221,27 @@ static void *translate_worker(void *arg) {
                 fi = maxwell_translate(fc, flen, STAGE_FRAGMENT, &fk);
             }
             pthread_mutex_unlock(&g_translate_lock);
+            atomic_fetch_add(&g_translated, 1);
             if (!vi || !vi->msl || !fi || !fi->msl) {
                 atomic_fetch_add(&g_translate_failed, 1);
                 note_failure(!vi || !vi->msl ? "vs" : "fs", !vi || !vi->msl ? vi : fi, !vi || !vi->msl ? vc : fc,
                              !vi || !vi->msl ? vlen : flen);
-            } else if (!(ok = spirv(vi->msl, STAGE_VERTEX, "vs") && spirv(fi->msl, STAGE_FRAGMENT, "fs")))
-                atomic_fetch_add(&g_spirv_failed, 1);
+            } else {
+                size_t nv_words = 0, nf_words = 0;
+                uint32_t *vwords = vk_glsl_to_spirv(vi->msl, STAGE_VERTEX, "vs", &nv_words);
+                uint32_t *fwords = vwords ? vk_glsl_to_spirv(fi->msl, STAGE_FRAGMENT, "fs", &nf_words) : NULL;
+                ok = vwords && fwords;
+                if (!ok) atomic_fetch_add(&g_spirv_failed, 1);
+                if (ok && vk_gpl_available()) {  // (ok stays "SPIR-V ready": a library failure is counted on its own)
+                    if (vk_gpl_prepare_spirv_pair(vwords, nv_words, fwords, nf_words)) atomic_fetch_add(&g_gpl_pairs, 1);
+                    else atomic_fetch_add(&g_gpl_failed, 1);
+                }
+                free(vwords);
+                free(fwords);
+            }
             if (vi) maxwell_free(vi);
             if (fi) maxwell_free(fi);
+            atomic_fetch_add(&g_lib_done, 1);
         }
         if (ok) atomic_fetch_add(&g_ok, 1);
         atomic_fetch_add(&g_done, 1);
@@ -234,17 +256,19 @@ static int cmp_job(const void *a, const void *b) {
 
 typedef struct {
     bool found;
+    bool gpl;
     char why[256];
     uint32_t stages, programs;
-    int pairs, compute, unsupported, incomplete;
+    int pairs, compute, unsupported, incomplete, gpl_pairs;
     const char *key_source;
 } CatalogReport;
 
-static void translate_catalog(const char *dir, int jobs, const VkWarmSummary *warm, double p0, double p1,
-                              CatalogReport *rep) {
+// The catalog's job list and the shader key (before any work starts, so the progress total is known from the start)
+static void catalog_prepare(const char *dir, int jobs, const VkWarmSummary *warm, CatalogReport *rep) {
     memset(rep, 0, sizeof *rep);
     if (!catalog_open(dir, &g_cat, rep->why, sizeof rep->why)) return;
     rep->found = true;
+    rep->gpl = vk_gpl_available();
     rep->stages = g_cat.nstages;
     rep->programs = g_cat.nprogs;
     g_jobs = malloc(sizeof *g_jobs * (g_cat.nprogs ? g_cat.nprogs : 1));
@@ -275,7 +299,7 @@ static void translate_catalog(const char *dir, int jobs, const VkWarmSummary *wa
     if (warm->found && warm->recipes) {
         g_vkey.flip_y = warm->flip_y[1] >= warm->flip_y[0];
         g_vkey.depth_minus_one = warm->depth_minus_one[1] > warm->depth_minus_one[0];
-        rep->key_source = "this PC's recipes";
+        rep->key_source = "recorded recipes";
     }
     g_fkey = (ShaderKey){0};
     g_fkey.glsl = 1;
@@ -285,18 +309,58 @@ static void translate_catalog(const char *dir, int jobs, const VkWarmSummary *wa
                     "depth_minus_one %d (%s); %d threads\n",
             dir, g_cat.nstages, g_cat.nprogs, rep->pairs, rep->compute, rep->unsupported, rep->incomplete, g_vkey.flip_y,
             g_vkey.depth_minus_one, rep->key_source, jobs);
+}
+
+// ------------------------------------------------------------------ progress
+// One percentage over every unit of work, each counted only once it has finished (queued work is not "done"):
+//   recorded recipes: programs (translation + SPIR-V + shader-stage libraries), complete pipelines, and - with
+//   graphics pipeline libraries - each pipeline's optimized (complete) replacement, built in the background;
+//   the catalog: translations, then the shader-stage libraries of each vertex+fragment pair.
+static struct { int programs, pipelines, optimized, cat_jobs, cat_pairs; bool libraries; } g_total;
+
+static int optimized_total(const VkWarmSummary *w) {
+    int done, ok, queued;
+    vk_gpl_optimize_progress(&done, &ok, &queued);
+    // (until every pipeline is created, each one is expected to queue its replacement; then the real count)
+    return w->pipelines_done >= g_total.pipelines || queued > g_total.optimized ? queued : g_total.optimized;
+}
+
+static void report_progress(const char *phase) {
+    VkWarmSummary w;
+    vk_warm_summary(&w);
+    int odone, ook, oqueued;
+    vk_gpl_optimize_progress(&odone, &ook, &oqueued);
+    int otot = optimized_total(&w);
+    int tr = atomic_load(&g_translated), lib = g_total.libraries ? atomic_load(&g_lib_done) : 0;
+    double done = w.programs_done + w.pipelines_done + odone + tr + lib;
+    double total = g_total.programs + g_total.pipelines + otot + g_total.cat_jobs + (g_total.libraries ? g_total.cat_pairs : 0);
+    char text[320];
+    if (!strcmp(phase, "recipes"))
+        snprintf(text, sizeof text, "Recorded pipelines: programs %d/%d prepared, pipelines %d/%d created%s", w.programs_done,
+                 g_total.programs, w.pipelines_done, g_total.pipelines, otot ? ", optimizing in the background" : "");
+    else if (!strcmp(phase, "catalog") && g_total.libraries)
+        snprintf(text, sizeof text, "Game shader catalog: %d/%d translated to SPIR-V, shader-stage libraries %d/%d", tr,
+                 g_total.cat_jobs, lib, g_total.cat_pairs);
+    else if (!strcmp(phase, "catalog"))
+        snprintf(text, sizeof text, "Game shader catalog: %d/%d translated to SPIR-V", tr, g_total.cat_jobs);
+    else snprintf(text, sizeof text, "Optimizing pipelines for this graphics card: %d/%d", odone, otot);
+    tp_progress(0.02 + 0.96 * (total > 0 ? done / total : 1), text);
+}
+
+static void catalog_run(int jobs) {
     maxwell_gmem_base = HEAP_BASE;  // (exec.c translate_program: the GLSL addresses global memory from here)
     maxwell_gmem_size = HEAP_MAX;
     pthread_t th[64];
     if (jobs > 64) jobs = 64;
     for (int i = 0; i < jobs; i++) pthread_create(&th[i], NULL, translate_worker, NULL);
     while (atomic_load(&g_done) < g_njobs) {
-        char text[160];
-        snprintf(text, sizeof text, "Translating the game's shaders to SPIR-V: %d of %d", atomic_load(&g_done), g_njobs);
-        tp_progress(p0 + (p1 - p0) * (g_njobs ? (double)atomic_load(&g_done) / g_njobs : 1), text);
+        report_progress("catalog");
         SDL_Delay(100);
     }
     for (int i = 0; i < jobs; i++) pthread_join(th[i], NULL);
+    if (vk_gpl_available())
+        fprintf(stderr, "[shaderprep] shader-stage libraries created for %d of %d vertex+fragment pairs (%d failed)\n",
+                atomic_load(&g_gpl_pairs), g_total.cat_pairs, atomic_load(&g_gpl_failed));
     for (int i = 0; i < g_nreasons; i++)
         fprintf(stderr, "[shaderprep] not translated (%d): %s\n", g_reasons[i].count, g_reasons[i].text);
 }
@@ -319,6 +383,8 @@ static void write_report(const char *status, const char *reason, const char *dev
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
+    int opt_done = 0, opt_ok = 0, opt_queued = 0;
+    if (w) vk_gpl_optimize_progress(&opt_done, &opt_ok, &opt_queued);
     fprintf(f, "{\n  \"format\": \"trirod-shaderprep\",\n  \"schema\": 1,\n  \"status\": ");
     json_str(f, status);
     fprintf(f, ",\n  \"reason\": ");
@@ -332,17 +398,21 @@ static void write_report(const char *status, const char *reason, const char *dev
     fprintf(f, ", \"vendor\": %u, \"device\": %u, \"driver\": %u},\n", vendor, device, driver);
     fprintf(f, "  \"recipes\": {\"found\": %s, \"why\": ", w && w->found ? "true" : "false");
     json_str(f, w ? w->why : "");
-    fprintf(f, ", \"read\": %u, \"programs\": %d, \"programs_ok\": %d, \"pipelines\": %d, \"pipelines_ok\": %d, "
+    fprintf(f, ", \"read\": %u, \"shared_catalog\": %u, \"programs\": %d, \"programs_ok\": %d, \"pipelines\": %d, \"pipelines_ok\": %d, "
                "\"missing_code\": %d, \"invalid\": %d},\n",
-            w ? w->recipes : 0, w ? w->programs : 0, w ? w->programs_ok : 0, w ? w->pipelines : 0,
+            w ? w->recipes : 0, w ? w->shared_recipes : 0, w ? w->programs : 0, w ? w->programs_ok : 0, w ? w->pipelines : 0,
             w ? w->pipelines_ok : 0, w ? w->missing_code : 0, w ? w->invalid : 0);
     fprintf(f, "  \"catalog\": {\"found\": %s, \"why\": ", c && c->found ? "true" : "false");
     json_str(f, c ? c->why : "");
     fprintf(f, ", \"stages\": %u, \"program_variations\": %u, \"graphics_pairs\": %d, \"compute\": %d, "
                "\"skipped_geometry_tessellation\": %d, \"skipped_incomplete\": %d, \"spirv_ok\": %d, "
-               "\"translate_failed\": %d, \"spirv_failed\": %d, \"pipelines_created\": 0, \"key_source\": ",
+               "\"translate_failed\": %d, \"spirv_failed\": %d, \"gpl_available\": %s, "
+               "\"gpl_failed\": %d, "
+               "\"shader_library_pairs_created\": %d, \"complete_pipelines_from_catalog\": 0, "
+               "\"optimized_pipelines\": %d, \"optimized_queued\": %d, \"key_source\": ",
             c ? c->stages : 0, c ? c->programs : 0, c ? c->pairs : 0, c ? c->compute : 0, c ? c->unsupported : 0,
-            c ? c->incomplete : 0, atomic_load(&g_ok), atomic_load(&g_translate_failed), atomic_load(&g_spirv_failed));
+            c ? c->incomplete : 0, atomic_load(&g_ok), atomic_load(&g_translate_failed), atomic_load(&g_spirv_failed),
+            c && c->gpl ? "true" : "false", atomic_load(&g_gpl_failed), c ? c->gpl_pairs : 0, opt_ok, opt_queued);
     json_str(f, c && c->key_source ? c->key_source : "");
     fprintf(f, "}\n}\n");
     bool ok = fclose(f) == 0;
@@ -383,6 +453,14 @@ int main(int argc, char **argv) {
     if (jobs < 1) jobs = SDL_GetNumLogicalCPUCores() > 2 ? SDL_GetNumLogicalCPUCores() - 1 : 1;
     tp_event("protocol %d Trirod-ShaderPrep %s", TOOL_PROTOCOL, TRIROD_VERSION);
     rt_paths_init();
+    char warm_file[1200], warm_dir[1200];
+    if (rt_resource("shader_catalog/warm/recipes.bin", "shader_catalog/warm/recipes.bin", warm_file, sizeof warm_file)) {
+        snprintf(warm_dir, sizeof warm_dir, "%s", warm_file);
+        char *slash = strrchr(warm_dir, '/');
+        char *backslash = strrchr(warm_dir, '\\');
+        if (!slash || (backslash && backslash > slash)) slash = backslash;
+        if (slash) { *slash = 0; vk_warm_catalog_set(warm_dir); }
+    }
     tp_stage("shaders", "Preparing shaders for the graphics device");
     uint64_t t0 = SDL_GetTicksNS();
     char why[160];
@@ -399,10 +477,32 @@ int main(int argc, char **argv) {
     tp_event("info Graphics device: %s (vendor 0x%04x, device 0x%04x, driver 0x%08x, Vulkan %u.%u)", dev, vendor, device,
              driver, VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api));
 
-    // 1. the recorded recipes: whole pipelines
+    // What is built, in order (one progress total for all of it: report_progress):
+    //  1. recorded recipes: complete pipelines (programs translated + compiled, then each pipeline created on this
+    //     GPU; with graphics pipeline libraries also its optimized replacement, in the background)
+    //  2. the game's shader catalog: SPIR-V, plus shader-stage libraries per vertex+fragment pair when supported
+    //  3. wait for the optimized replacements, then save the cache
     VkWarmSummary warm = {0};
     if (use_recipes) {
-        vk_warm_start();
+        vk_warm_start();  // (loads the recipes and queues their programs on the runtime's shader threads)
+        vk_warm_summary(&warm);
+        g_total.programs = warm.programs;
+        g_total.pipelines = warm.pipelines;
+        const char *lto = getenv("EOWRECOMP_VK_GPL_OPTIMIZE");
+        g_total.optimized = vk_gpl_available() && !(lto && atoi(lto) == 0) ? warm.pipelines : 0;
+    }
+    CatalogReport cat = {0};
+    if (use_catalog) {
+        catalog_prepare(catalog, jobs, &warm, &cat);
+        g_total.cat_jobs = g_njobs;
+        g_total.cat_pairs = cat.pairs;
+        g_total.libraries = cat.gpl;
+    }
+    tp_event("info Graphics pipeline libraries: %s",
+             vk_gpl_available() ? "available (shader-stage libraries, fast-linked pipelines, optimized in the background)"
+                                : "not available on this GPU/driver: complete (monolithic) pipelines only");
+
+    if (use_recipes) {
         int done = 0, total = 0, last_done = -1;
         uint64_t last_change = SDL_GetTicksNS();
         while (vk_warm_progress(&done, &total)) {
@@ -412,33 +512,58 @@ int main(int argc, char **argv) {
                 tp_event("warn the recorded pipelines stopped progressing for 10 minutes; the rest is left to the game");
                 break;
             }
-            char text[160];
-            snprintf(text, sizeof text, "Building recorded pipelines: %d of %d", done, total);
-            tp_progress(0.02 + 0.58 * (total ? (double)done / total : 1), text);
+            report_progress("recipes");
             SDL_Delay(100);
         }
         vk_warm_summary(&warm);
         if (warm.found)
-            tp_event("info Recorded on this PC: %d of %d programs and %d of %d pipelines built (%d recipes without "
-                     "their cached code, %d invalid)", warm.programs_ok, warm.programs, warm.pipelines_ok, warm.pipelines,
-                     warm.missing_code, warm.invalid);
+            tp_event("info Recorded recipes: %u read (%u from the bundled catalog); programs %d of %d built, complete "
+                     "pipelines %d of %d created; skipped: %d recipes without their shader code, %d invalid or for "
+                     "formats this GPU lacks", warm.recipes, warm.shared_recipes, warm.programs_ok, warm.programs,
+                     warm.pipelines_ok, warm.pipelines, warm.missing_code, warm.invalid);
         else
             tp_event("info No recorded pipelines to build (%s): the game records them while it runs", warm.why);
     }
 
-    // 2. the game's shader catalog: SPIR-V only
-    CatalogReport cat = {0};
     if (use_catalog) {
-        translate_catalog(catalog, jobs, &warm, 0.6, 0.97, &cat);
-        if (cat.found)
+        if (cat.found) {
+            catalog_run(jobs);
+            cat.gpl_pairs = atomic_load(&g_gpl_pairs);
             tp_event("info Game shader catalog: %d of %d translated to SPIR-V (%d vertex+fragment pairs, %d compute; "
-                     "%d translation and %d SPIR-V failures); no pipelines are created from it",
-                     atomic_load(&g_ok), g_njobs, cat.pairs, cat.compute, atomic_load(&g_translate_failed),
-                     atomic_load(&g_spirv_failed));
-        else tp_event("warn %s: only recorded pipelines were prepared", cat.why);
+                     "%d translation and %d SPIR-V failures)", atomic_load(&g_ok), g_njobs, cat.pairs, cat.compute,
+                     atomic_load(&g_translate_failed), atomic_load(&g_spirv_failed));
+            if (cat.gpl)
+                tp_event("info Shader-stage libraries: %d of %d vertex+fragment pairs (%d failed). Complete pipelines also "
+                         "need each draw's vertex formats, render targets and blend state, which the shader archives do "
+                         "not contain: they are linked in game, quickly", cat.gpl_pairs, cat.pairs,
+                         atomic_load(&g_gpl_failed));
+            else
+                tp_event("info No shader-stage libraries (not supported here): the catalog prepares SPIR-V only; complete "
+                         "pipelines need each draw's render state and are built in game");
+        } else tp_event("warn %s: only recorded pipelines were prepared", cat.why);
         if (cat.unsupported)
             tp_event("info %d catalog programs have geometry/tessellation stages, which the Vulkan backend does not "
                      "build: skipped", cat.unsupported);
+    }
+
+    // 3. the optimized replacements still queued (they ran alongside the catalog), then nothing may be left running
+    //    when the cache is read: every job has finished
+    {
+        int odone, ook, oqueued, last = -1;
+        uint64_t last_change = SDL_GetTicksNS();
+        while (vk_exec_jobs_pending()) {
+            vk_gpl_optimize_progress(&odone, &ook, &oqueued);
+            if (odone != last) last = odone, last_change = SDL_GetTicksNS();
+            if (SDL_GetTicksNS() - last_change > 600000000000ull) {
+                tp_event("warn pipeline optimization stopped progressing for 10 minutes; saving what is finished");
+                break;
+            }
+            report_progress("optimize");
+            SDL_Delay(100);
+        }
+        vk_gpl_optimize_progress(&odone, &ook, &oqueued);
+        if (oqueued)
+            tp_event("info Optimized pipelines: %d of %d (the fast-linked pipeline is used where one failed)", ook, oqueued);
     }
 
     tp_progress(0.98, "Saving the pipeline cache");

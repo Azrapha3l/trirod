@@ -49,6 +49,15 @@ Copy-Item -LiteralPath (Join-Path $root 'build\helper\trgen') -Destination $tool
 Copy-Item -LiteralPath (Join-Path $root 'build\zig') -Destination (Join-Path $tools 'zig') -Recurse
 Copy-Item -LiteralPath (Join-Path $build 'link-kit') -Destination $tools -Recurse
 
+# Ship only the curated runtime-learned shader warm set. It contains Maxwell code records and portable pipeline
+# recipes, never the local Vulkan driver's opaque pipeline cache or the user's full shader/GLSL caches.
+$warmCatalog = Join-Path $root 'shader_catalog\warm'
+if (Test-Path -LiteralPath (Join-Path $warmCatalog 'recipes.bin')) {
+    $warmStage = Join-Path $tools 'shader_catalog\warm'
+    New-Item -ItemType Directory -Force -Path (Split-Path $warmStage -Parent) | Out-Null
+    Copy-Item -LiteralPath $warmCatalog -Destination $warmStage -Recurse
+}
+
 # Zig's Windows linker consumes import libraries from link-kit/lib. Keep the original MSYS
 # archives and add canonical .lib aliases for names used by link.args.
 $linkLibs = Join-Path $tools 'link-kit\lib'

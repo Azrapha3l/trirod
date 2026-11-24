@@ -20,6 +20,7 @@ Install folder layout (`setup/pack_tools.ps1` stages it; a release zip unpacks t
 ```
 Trirod-Launcher.exe  trbuild.exe  Trirod-ShaderPrep.exe  <runtime DLLs>  icon.png  trirod.ico
 tools\  trirod-tools.json  trgen\  zig\  link-kit\  gamelib-src\  source\
+       shader_catalog\warm\recipes.bin  shader_catalog\warm\code\
 ```
 
 By default the data folder is the install folder. `--data <folder>` moves it elsewhere. It holds `extracted\` (game
@@ -77,28 +78,131 @@ Data available, by kind:
 
 | Data | Source | Portable? | Used for |
 | --- | --- | --- | --- |
-| Maxwell control and code records, plus the vertex/fragment/compute pairing of each program variation | the game's BNSH archives (`extracted\shader_catalog`, `trgen --shader-catalog`) | Yes: identical on every PC. It is still Nintendo's code, so it is never shipped in a release (the repository's `shader_catalog/` is the exception the user authorized, and `check_package.ps1` refuses it in packages). | Translation to GLSL and SPIR-V |
-| Pipeline recipes: code IDs, both `ShaderKey`s, and every `PipeKey` field (vertex formats, targets, blend, depth state) | recorded by the runtime while the game runs (`cache\warm\recipes.bin` + `warm\code\`) | No: tagged with the GPU's vendor/device ID because formats are chosen per device | Complete pipelines |
+| Maxwell control and code records, plus the vertex/fragment/compute pairing of each program variation | the game's BNSH archives (`extracted\shader_catalog`, `trgen --shader-catalog`) | Prepared from each player's game files. The source tree has an authorized shader catalog; releases ship only the curated runtime warm recipes described below. | Translation to GLSL and SPIR-V |
+| Pipeline recipes and referenced Maxwell code | gameplay captures exported to the tracked `shader_catalog\warm\` directory | Portable recipe schema; each device validates formats and rebuilds compatible pipelines locally | Complete pipelines for previously observed draw states |
+| Additional local recipes | recorded by the runtime while each player runs the game (`cache\warm\recipes.bin` + `warm\code\`) | Tagged with that player's GPU; retained in the player's data folder | Newly discovered local variants |
 | GLSL → SPIR-V | `cache\spirv\` (keyed by the GLSL text) | Portable in principle, but local | Skips glslang at run time |
 | Driver pipeline cache | `cache\vk_pipelines.bin` | No: specific to device and driver; Vulkan discards incompatible data | Faster `vkCreate*Pipelines` |
+
+The tracked `shader_catalog\warm\` is the shared exception: its schema-2 recipe header uses wildcard GPU IDs. Each
+device validates the recorded Vulkan formats and rebuilds compatible recipes with its own driver. The game continues
+recording additional recipes into the player's local cache, tagged for that GPU. ShaderPrep merges compatible shared
+recipes with local ones, copies their verified guest code into the player's data folder, and saves the resulting local
+recipe set and driver cache. The source catalog does not include the `glsl` diagnostic folder or the large local
+`spirv` cache: ShaderPrep regenerates SPIR-V from the shared recipe code and the player's extracted game shader catalog.
 
 `Trirod-ShaderPrep` does the following:
 
 1. It opens the device the game would choose (the `eowrecomp.ini` GPU, otherwise discrete > integrated), with no
    window or swapchain.
-2. It rebuilds every recorded recipe through the runtime's warmup path (`vk_warm_start`). These are whole pipelines.
-3. It translates every catalog vertex+fragment pair and every compute shader with the runtime translator, then compiles
-   each to SPIR-V into the runtime's cache. Compute shaders have only one key, so they match the runtime exactly.
-   Graphics pairs use the key of a plain draw: float vertex inputs and colour targets, plus the window-origin and
-   depth-mode flags from this PC's recipes or the game's defaults. **No pipelines are created from the catalog**:
-   the archives do not contain vertex formats, render-target formats, blend/depth state, or each draw's `ShaderKey`.
-   Programs with geometry or tessellation stages are counted and skipped, because the Vulkan backend builds only
-   vertex+fragment programs.
-4. It saves `vk_pipelines.bin` and the recipes, then writes `cache\shaderprep.json` (counts, device, runtime build
-   ID). The launcher shows its summary under **Play**.
+2. It loads local recipes and the packaged schema-2 warm catalog through the runtime's warmup path (`vk_warm_start`).
+   It checks shader-code hashes and each device's Vulkan format support, copies verified shared code into the player's
+   `cache\warm\code\`, and rebuilds compatible whole pipelines with the local driver. Shared recipes are merged into
+   the player's device-tagged local recipe file for future game starts.
+3. It translates every game-catalog vertex+fragment pair and every compute shader with the runtime translator, then compiles
+   each to SPIR-V into the runtime's cache. When the selected Vulkan device supports `VK_EXT_graphics_pipeline_library`,
+   ShaderPrep also creates reusable vertex/pre-raster and fragment-shader libraries for each graphics pair. At runtime,
+   Trirod links those with small vertex-input and render-target libraries, then creates an optimized replacement in the
+   background. Compute shaders have one key and match the runtime exactly. Graphics pairs use a plain-draw key; a draw
+   whose `ShaderKey` differs still translates on demand. The catalog libraries do not encode vertex formats, target
+   formats, blend/depth state, or every draw's key, so complete draw pipelines are still formed from runtime or captured
+   pipeline recipes. Devices without GPL or without a driver fast-linking guarantee use the existing monolithic path.
+   Programs with geometry or tessellation stages
+   are counted and skipped, because the Vulkan backend builds only vertex+fragment programs.
+4. With graphics pipeline libraries, each recipe pipeline's optimized replacement (the complete pipeline) is built in the
+   background while the catalog runs. ShaderPrep waits for those jobs, with progress, before it saves.
+5. It saves `vk_pipelines.bin`, its tag `vk_pipelines.tag` (pipeline scheme, `prepared 1`, vendor, device, driver,
+   GPU name) and the recipes, then writes `cache\shaderprep.json` (counts, device, runtime build ID). The launcher shows
+   its summary under the step.
+
+**Progress.** The step shows one percentage over every unit of work, counted only when it has finished, plus a line
+for the current phase with completed/total counts:
+- "Recorded pipelines": programs prepared and complete pipelines created.
+- "Game shader catalog": shaders translated to SPIR-V and shader-stage libraries created.
+- "Optimizing pipelines for this graphics card": the background replacements.
+
+The `@@info` lines afterwards say what was built and what was skipped, and why. Complete pipelines come only from
+recipes, because the shader archives have no vertex formats, render targets or blend state.
+
+**Using the cache.** At start, `Trirod.exe` uses `vk_pipelines.bin` only when all of these hold:
+- the driver header's vendor, device and `pipelineCacheUUID` match the selected GPU (the UUID changes with driver
+  updates);
+- the tag's pipeline scheme matches (scheme 3; caches written before 2026-11-24 have no tag and are not used).
+
+Otherwise it starts an empty cache and writes the reason to `cache\shaders-stale.txt`; it does the same when the cache
+was built by the game rather than prepared by Setup. The launcher shows that reason under **Play**. **Prepare shaders**
+(or `Trirod-Launcher.exe --prepare-shaders`) runs only `Trirod-ShaderPrep` for the already-built game and clears the
+notice.
+
+**After a GPU or driver change.** If Setup prepared shaders on this PC before (`cache\shaderprep.json` exists) but
+the cache doesn't match the selected GPU, driver or scheme, `Trirod.exe` runs `Trirod-ShaderPrep` itself before the
+game starts. It looks for the tool on `PATH` (Play puts the install folder first), then beside the game, and accepts
+only a copy whose `--version` runtime ID matches `Trirod.exe.id`, so a stale copy in the data folder is not used:
+- It shows a progress panel with the reason, phase counts, percentage and elapsed time, then merges the result into
+  its pipeline cache.
+- Esc, B or Back skips the preparation, and the game builds shaders as it meets them.
+- It runs once per device and driver (`cache\prep-attempt.txt`). `EOWRECOMP_PREPARE_SHADERS=0` never runs it;
+  `=1` also repeats it.
+- Output goes to `logs\shaderprep-game.log`.
+- A data folder keeps one cache: switching back to the first GPU prepares again.
+
+**Shader-stage libraries and optimized pipelines (GPL).**
+- A draw's first pipeline is fast-linked from the program's two shader-stage libraries plus small vertex-input and
+  output libraries.
+- The optimized replacement is the complete pipeline for the same state, built on a low-priority worker (as in
+  DXVK).
+- Libraries are never linked with link-time optimization: that needs RETAIN info. Without it the link is invalid and
+  drew nothing on NVIDIA; with it the cache grows.
+- Cost measured on an test GPU: the catalog's 7405 library pairs take about 1.13 GB of `vk_pipelines.bin`, and game
+  start to the title was 2–6 s slower with that cache.
+
+**In the game: prepared pipelines are built at boot.** Setup's preparation fills only the driver's cache. Each
+pipeline still needs its program translated by the runtime (one serialized translator thread) and
+`vkCreateGraphicsPipelines` called before a draw can use it.
+
+So before the game starts, `Trirod.exe` builds every recorded recipe from `cache\warm` on the shader threads, as TOTK
+does with pipeline keys seen in play and Triforce with its precompile at start.
+- With a prepared cache, 1133 pipelines took 1.7 s on an test GPU, every one from the driver cache.
+- A progress panel appears if it takes longer than 0.3 s; Esc or B starts the game while the rest keeps building.
+- `EOWRECOMP_VK_WARM_WAIT=<s>` sets the longest wait (default 180 s); `EOWRECOMP_VK_WARM=0` turns recipes off.
+- Optimized replacements of fast-linked pipelines run on an idle tier, so they never delay this build or any draw.
+
+**When a draw meets something still building:**
+- A draw into a target that nothing drew into last frame (a one-shot pass) waits for its build, within the
+  per-frame budget, instead of being skipped. This is TOTK's rule.
+- A compute dispatch waits up to 250 ms.
+- Any other skipped draw makes the frame held: the window keeps the last complete image.
+
+Each session logs `[vk] session pipelines: ...` at exit (and every 30 s with verbose output on). It gives:
+- how many were prepared from recipes;
+- first draws that reused a ready or still-building pipeline, and first draws that missed (new);
+- programs reused and new;
+- driver cache hits, compiles and fast links (from `VK_PIPELINE_CREATION_FEEDBACK`).
+
+Misses are recorded as recipes in the player's `cache\warm`, so the next preparation and boot include them. To share
+them with all players, export them with `tools\export_shader_warm.py` (below).
 
 Anything not prepared, including any draw whose key or state differs, is still built by the runtime when first drawn,
-as before (`exec.c` `compile_wait`).
+on the shader threads (`exec.c` `compile_wait`). A frame in which draws were skipped because their program or
+pipeline was still building is not shown; the window keeps the last complete image for up to 500 ms in a row
+(`EOWRECOMP_VK_HOLD_MS`, `0` = off). After that, frames are shown as they are until a complete one arrives.
+Diagnostics:
+- `EOWRECOMP_VK_GPL=0`: monolithic pipelines only.
+- `EOWRECOMP_VK_GPL_OPTIMIZE=0`: fast-linked pipelines without optimized replacements.
+- With `--console` or `EOWRECOMP_VERBOSE=1`, the stats line shows queued shader jobs, and the log shows each held
+  stretch.
+
+The runtime does not export captures automatically. After playing a development build, merge its learned recipes into
+the tracked catalog from the repository root:
+
+```powershell
+python tools\export_shader_warm.py "[local path omitted]"
+```
+
+The exporter validates each recipe checksum and referenced shader-code hash, merges with the existing catalog, and
+writes only `shader_catalog\warm\recipes.bin` plus its `code\` records. Review and commit those files with the source
+update. `setup/pack_tools.ps1` includes only that curated directory under `tools\shader_catalog\warm` in the install;
+`setup/check_package.ps1` still rejects driver caches, raw `.spv` files, game archives, and other game data.
 
 Measured on 2026-11-23 on the development PC (test GPU, driver [driver details omitted]), in a scratch data folder with a
 copy of that install's recipes:
@@ -165,15 +269,21 @@ Development builds have no `UPDATE_REPO` and never contact GitHub, even without 
 
 ## Maintainer release procedure
 
-1. Make and review the source changes. Update `EOWRECOMP_VERSION` in `runtime/ui/launcher.mm`; it is the release tag
-   the Makefile, the tools, and the manifest use. The build identifiers change by themselves when the generator,
-   headers, or runtime sources change.
-2. Build with the update source:
-   `./setup/build.ps1 -UpdateRepo <owner>/<repo> -OutputDir build\setup-release`. Since alpha_2, every build makes
-   the launcher and `Trirod.exe` GUI programs (no console window), so there is no separate release switch.
-3. `./setup/make_release.ps1 -PackageDir build\setup-release -UpdateRepo <owner>/<repo> [-Required]`. It copies only
+1. Make and review the source changes. If gameplay added shader variants, export them with
+   `python tools/export_shader_warm.py "<data folder>\cache"`, review `shader_catalog\warm\`, and include those
+   reviewed files in the source commit. Build identifiers change automatically when generator, headers, or runtime
+   sources change.
+2. Run the single local deployment command, supplying the release version:
+   `./setup/deploy.ps1 -Version alpha_3`. It sets `EOWRECOMP_VERSION` in `runtime/ui/launcher.mm`, builds with
+   `Azrapha3l/trirod`, and creates the release files. `-MinLauncher` defaults to `alpha_1`, so alpha_1 and every
+   later comparable launcher version can install the release. Override it when needed, for example
+   `./setup/deploy.ps1 -Version alpha_3 -MinLauncher alpha_2`. Use `-Required` to mark an update as required.
+   The script does not upload or publish anything. Since alpha_2, every build makes the launcher and `Trirod.exe`
+   GUI programs (no console window), so there is no separate release switch.
+3. The script stages only
    the installation's own files into a fresh stage and runs `setup/check_package.ps1`, which refuses game files,
-   packages, keys, shader archives or catalog, built game code, and caches. It zips the stage with `tar.exe` and writes
+   packages, keys, shader archives, uncurated shader data, built game code, and caches. It includes the curated
+   `tools\shader_catalog\warm` records, then zips the stage with `tar.exe` and writes
    `build\release\<version>\Trirod-Tools-<version>.zip` and `trirod-release.json`
    (`format: "trirod-release"`, `schema: 1`, `version`, `channel: "windows-x64"`, `min_launcher`, `required`,
    `build.{gamelib_id, gamebuild_id, protocol}`, `assets[{name, kind: "tools", size, sha256}]`). It uploads nothing.

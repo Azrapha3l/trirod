@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../platform.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "../../ui/touch.h"
@@ -222,12 +223,98 @@ void vk_device_fault_report(void) {
             (unsigned long long)vend[i].vendorFaultData);
 }
 
+// ---- pipeline cache identity: <cache>/vk_pipelines.tag
+// vk_pipelines.bin starts with the driver's header: vendor, device and pipelineCacheUUID (which changes with the
+// driver). Vulkan ignores incompatible data by itself; it is checked here as well so the reason can be told. The tag
+// adds what the header can't say: the Trirod pipeline scheme and whether Trirod-ShaderPrep (Setup) prepared it.
+// Scheme 3: shader-stage libraries without RETAIN info, and optimized pipelines that are complete pipelines (exec.c
+// optimize_gpl_pipeline). Older caches are not used: untagged ones can hold link-time-optimized links of libraries
+// without RETAIN (invalid usage; on NVIDIA they drew nothing: the black screen of 2026-11-24), scheme 2 ones hold
+// RETAIN libraries (1.19 GB). When the cache wasn't prepared for this GPU and driver, the game writes the reason to
+// <cache>/shaders-stale.txt; the launcher shows it and offers "Prepare shaders".
+#define PIPELINE_SCHEME 3
+static bool g_pc_prepared;  // the loaded cache was prepared by Trirod-ShaderPrep for this device and driver
+static bool g_prep_in_game;  // prepare_shaders_in_game: Setup prepared shaders before, but not for this GPU / driver
+static char g_prep_why[320], g_prep_key[160];
+
+// The device + driver + scheme an in-game preparation was last tried for (<cache>/prep-attempt.txt): finished, failed
+// or skipped, it is not started again by itself for the same ones (the launcher's notice and button remain).
+static void prep_attempt_key(char *out, size_t n) {
+    const VkPhysicalDeviceProperties *p = &g_vk.props;
+    int k = snprintf(out, n, "%d %u %u %u ", PIPELINE_SCHEME, p->vendorID, p->deviceID, p->driverVersion);
+    for (int i = 0; i < VK_UUID_SIZE && k + 2 < (int)n; i++) k += snprintf(out + k, n - k, "%02x", p->pipelineCacheUUID[i]);
+}
+
+static void stale_note(const char *why) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/shaders-stale.txt", vk_cache_dir());
+    if (!why) { remove(path); return; }
+    FILE *f = fopen(path, "wb");
+    if (f) { fprintf(f, "%s\n", why); fclose(f); }
+}
+
+static bool pipeline_cache_check(const void *data, size_t sz) {
+    const VkPhysicalDeviceProperties *p = &g_vk.props;
+    char path[600], line[200], gpu[160] = "", why[320] = "";
+    int scheme = 0, prepared = 0;
+    snprintf(path, sizeof path, "%s/vk_pipelines.tag", vk_cache_dir());
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            sscanf(line, "trirod-pipelines %d", &scheme);
+            sscanf(line, "prepared %d", &prepared);
+            if (!strncmp(line, "gpu ", 4)) snprintf(gpu, sizeof gpu, "%s", line + 4);
+        }
+        fclose(f);
+    }
+    const VkPipelineCacheHeaderVersionOne *h = data;
+    if (!data || !sz) snprintf(why, sizeof why, "no shader cache yet");
+    else if (sz < sizeof *h || h->headerSize < sizeof *h || h->headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE)
+        snprintf(why, sizeof why, "the shader cache file is damaged");
+    else if (h->vendorID != p->vendorID || h->deviceID != p->deviceID)
+        snprintf(why, sizeof why, "shaders were prepared for another graphics card (%s)", gpu[0] ? gpu : "unknown");
+    else if (memcmp(h->pipelineCacheUUID, p->pipelineCacheUUID, VK_UUID_SIZE))
+        snprintf(why, sizeof why, "the graphics driver changed since the shaders were prepared");
+    else if (scheme != PIPELINE_SCHEME)
+        snprintf(why, sizeof why, "the shader cache is from an older Trirod build");
+    bool use = !why[0];
+    g_pc_prepared = use && prepared;
+    if (!use && data && sz) LOG("[vk] pipeline cache not used: %s\n", why);
+    if (!g_headless) {
+        if (use && !prepared) snprintf(why, sizeof why, "shaders were not prepared by Setup for this graphics card and driver");
+        stale_note(g_pc_prepared ? NULL : why);
+        if (!g_pc_prepared)
+            LOG("[vk] %s: Setup's \"Prepare shaders\" builds them before Play; meanwhile the game builds them as it goes\n", why);
+        else LOG("[vk] using the shader cache prepared for %s\n", p->deviceName);
+        // Setup prepared shaders on this PC before (its report is there), but not for this GPU / driver / scheme: the
+        // game prepares them itself at start, once per device and driver (backend_init)
+        snprintf(path, sizeof path, "%s/shaderprep.json", vk_cache_dir());
+        struct stat st;
+        if (!g_pc_prepared && stat(path, &st) == 0) {
+            char last[160] = "";
+            snprintf(path, sizeof path, "%s/prep-attempt.txt", vk_cache_dir());
+            if ((f = fopen(path, "rb"))) {
+                if (!fgets(last, sizeof last, f)) last[0] = 0;
+                last[strcspn(last, "\r\n")] = 0;
+                fclose(f);
+            }
+            prep_attempt_key(g_prep_key, sizeof g_prep_key);
+            const char *e = getenv("EOWRECOMP_PREPARE_SHADERS");  // 0: never in game; 1: also when tried before
+            g_prep_in_game = e && *e ? atoi(e) != 0 && (atoi(e) == 1 || strcmp(last, g_prep_key)) : strcmp(last, g_prep_key) != 0;
+            snprintf(g_prep_why, sizeof g_prep_why, "%s", why);
+            if (!g_prep_in_game) LOG("[vk] in-game shader preparation already tried for this GPU and driver: not repeated\n");
+        }
+    }
+    return use;
+}
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[12];
+    const char *ext[16];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -248,12 +335,37 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
-    free(ep);
-
-    // Query the descriptor-indexing and formatless-storage-image features used by bindless SUSTB.
     VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have12};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+#ifdef VK_EXT_graphics_pipeline_library
+    bool gpl_ext = has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    bool pipeline_lib_ext = has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT have_gpl = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    if (gpl_ext && pipeline_lib_ext) {
+        have12.pNext = &have_gpl;
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    }
+    // EOWRECOMP_VK_GPL=0: monolithic pipelines only, also on a GPU with graphics pipeline libraries (A/B tests)
+    const char *gpl_env = getenv("EOWRECOMP_VK_GPL");
+    g_vk.graphics_pipeline_library = gpl_ext && pipeline_lib_ext && have_gpl.graphicsPipelineLibrary &&
+                                     !(gpl_env && atoi(gpl_env) == 0);
+    if (g_vk.graphics_pipeline_library) {
+        ext[n_ext++] = VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME;
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &gpl_props};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &props);
+        g_vk.gpl_fast_linking = gpl_props.graphicsPipelineLibraryFastLinking;
+        if (!g_vk.gpl_fast_linking)
+            LOG("[vk] graphics pipeline library available, but fast linking is not reported by the driver\n");
+    }
+#endif
+    free(ep);
+
+    // Query the descriptor-indexing and formatless-storage-image features used by bindless SUSTB.
     g_vk.bindless_storage_images = have12.runtimeDescriptorArray && have12.descriptorBindingPartiallyBound &&
                                    have12.descriptorBindingVariableDescriptorCount &&
                                    have12.shaderStorageImageArrayNonUniformIndexing && have.features.shaderStorageImageWriteWithoutFormat &&
@@ -261,17 +373,23 @@ static void create_device(void) {
                                    g_vk.props.limits.maxPerStageDescriptorStorageImages > 0;
     if (!g_vk.bindless_storage_images)
         LOG("[vk] bindless storage-image writes unavailable (descriptor indexing / formatless storage-write feature missing)\n");
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
+        .graphicsPipelineLibrary = g_vk.graphics_pipeline_library};
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
-        .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
+        .customBorderColorWithoutFormat = VK_TRUE,
+        .pNext = g_vk.divisor ? (void *)&div : g_vk.graphics_pipeline_library ? (void *)&gpl : NULL};
+    if (g_vk.divisor) div.pNext = g_vk.graphics_pipeline_library ? &gpl : NULL;
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
                                             .maintenance4 = VK_TRUE,
-                                            .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
+                                            .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div :
+                                                     g_vk.graphics_pipeline_library ? (void *)&gpl : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
@@ -315,6 +433,8 @@ static void create_device(void) {
     volkLoadDevice(g_vk.dev);
 #endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    LOG("[vk] graphics pipeline libraries: %s%s\n", g_vk.graphics_pipeline_library ? "enabled" : "unavailable",
+        g_vk.graphics_pipeline_library ? (g_vk.gpl_fast_linking ? " (fast linking reported)" : " (fast linking not reported)") : "; using monolithic pipelines");
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .vulkanApiVersion = VK_API_VERSION_1_3};
@@ -332,7 +452,8 @@ static void create_device(void) {
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &g_vk.pool));
 
-    // pipeline cache: <cache>/vk_pipelines.bin (written by vk_pipeline_cache_save)
+    // pipeline cache: <cache>/vk_pipelines.bin (written by vk_pipeline_cache_save), used only when it was made for
+    // this device and driver and by this pipeline scheme (pipeline_cache_check)
     size_t sz = 0;
     void *data = NULL;
     char pcpath[600];
@@ -346,6 +467,7 @@ static void create_device(void) {
         if (fread(data, 1, sz, fp) != sz) sz = 0;
         fclose(fp);
     }
+    if (!pipeline_cache_check(data, sz)) sz = 0;
     VkPipelineCacheCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = sz,
                                     .pInitialData = data};
     if (vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache) != VK_SUCCESS) {
@@ -369,6 +491,8 @@ const char *vk_cache_dir(void) {
 
 void vk_pipeline_cache_save(void) {
     extern void vk_warm_save(void);
+    // (no wait for running shader jobs: the cache is internally synchronized, and what they add later is saved next
+    // time. Trirod-ShaderPrep waits for its jobs itself, with progress, before calling this.)
     vk_warm_save();  // (exec.c: the pipeline recipes recorded this run)
     size_t sz = 0;
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
@@ -378,10 +502,19 @@ void vk_pipeline_cache_save(void) {
         snprintf(path, sizeof path, "%s/vk_pipelines.bin", vk_cache_dir());
         snprintf(tmp, sizeof tmp, "%s.tmp", path);
         FILE *f = fopen(tmp, "wb");
+        bool ok = false;
         if (f) {
-            bool ok = fwrite(data, 1, sz, f) == sz;
+            ok = fwrite(data, 1, sz, f) == sz;
+            ok = fclose(f) == 0 && ok;
+            if (ok) { remove(path); ok = rename(tmp, path) == 0; }
+        }
+        snprintf(path, sizeof path, "%s/vk_pipelines.tag", vk_cache_dir());
+        if (ok && (f = fopen(path, "wb"))) {  // (pipeline_cache_check: Setup's preparation stays "prepared" until the
+            const VkPhysicalDeviceProperties *p = &g_vk.props;  // GPU, driver or pipeline scheme changes)
+            fprintf(f, "trirod-pipelines %d\nprepared %d\nvendor %u\ndevice %u\ndriver %u\ngpu %s\n", PIPELINE_SCHEME,
+                    g_headless || g_pc_prepared, p->vendorID, p->deviceID, p->driverVersion, p->deviceName);
             fclose(f);
-            if (ok) { remove(path); rename(tmp, path); }
+            if (g_headless) stale_note(NULL);
         }
     }
     free(data);
@@ -710,6 +843,51 @@ static NvnTexture *g_last_presented;
 
 const float *vk_shot_crop(void) { return g_shot_crop; }
 
+// A frame with draws skipped because their shader program or pipeline was still building (exec.c compile_wait) has
+// holes, or is black where a skipped draw fed a later pass. Such a frame is not shown: nothing is acquired or
+// presented, so the window keeps the last complete image (the game's pacing is its own virtual vsync, vi.c). At most
+// EOWRECOMP_VK_HOLD_MS in a row (default 500, 0 = off); after that frames are shown as they are until a complete one,
+// so the game never looks frozen for long. The builds themselves run on the shader threads, not here.
+static bool hold_frame(uint64_t now) {
+    extern uint32_t vk_frame_pending_skips(void);
+    static int hold_ms = -1;
+    static long shot_frame = -1;
+    static uint64_t since;
+    static uint32_t held, held_skips;
+    if (hold_ms < 0) {
+        const char *e = getenv("EOWRECOMP_VK_HOLD_MS");
+        hold_ms = e && *e ? atoi(e) : 500;
+        shot_frame = getenv("EOWRECOMP_WINDOW_SHOT") ? atol(getenv("EOWRECOMP_WINDOW_SHOT")) : 0;
+    }
+    uint32_t pending = vk_frame_pending_skips();
+    bool shot = shot_frame && (long)total_frames + 1 == shot_frame;  // (the test's window shot is always taken)
+    if (pending && hold_ms > 0 && total_frames && !shot && (!since || now - since < (uint64_t)hold_ms * 1000000ull)) {
+        if (!since) {
+            since = now;
+            static bool told;
+            if (!told) told = true, LOG("[vk] shaders still building: keeping the last complete image (up to %d ms)\n", hold_ms);
+        }
+        held++;
+        held_skips += pending;
+        return true;
+    }
+    if (held)
+        LOG_VERBOSE("[vk] kept the last complete image for %u frames (%.0f ms) while %u draws waited for shader or "
+                    "pipeline builds (%u shader jobs queued)%s\n", held, (now - since) / 1e6, held_skips,
+                    vk_exec_jobs_pending(), pending ? "; limit reached, showing frames with missing draws" : "");
+    if (pending && since && now - since >= (uint64_t)hold_ms * 1000000ull) {  // (once per stretch: not verbose)
+        static uint64_t told_for;
+        if (told_for != since) {
+            told_for = since;
+            LOG("[vk] shaders still building after %d ms: showing frames with %u draws missing (%u shader jobs queued)\n",
+                hold_ms, pending, vk_exec_jobs_pending());
+        }
+    }
+    held = held_skips = 0;
+    if (!pending) since = 0;  // (after the limit: hold again only once a complete frame was shown)
+    return false;
+}
+
 void backend_present(NvnTexture *t);
 void backend_represent(void) {
     if (g_last_presented) backend_present(g_last_presented);
@@ -728,7 +906,7 @@ void backend_present(NvnTexture *t) {
     vk_full_barrier(vk_cmd());
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
-    bool have = vk_frame_begin(black);
+    bool have = !hold_frame(t0) && vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
     if (nd > 30000000) {
         static int warned;
@@ -875,6 +1053,9 @@ static void quick_exit_handler(void) {
     if (trace < 0) trace = getenv("EOWRECOMP_VK_TRACE") != NULL;
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
+        char sum[512];
+        vk_pipeline_session_summary(sum, sizeof sum);
+        LOG("[vk] session %s\n", sum);
         vkDeviceWaitIdle(g_vk.dev);
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
@@ -937,8 +1118,8 @@ void ui_window_init(void) {
     create_swapchain();
     vk_exec_init();
     vk_shaders_init();
-    extern void vk_warm_start(void);
-    vk_warm_start();  // (exec.c: rebuild the pipelines recorded by earlier runs)
+    extern void vk_warm_load_records(void);
+    vk_warm_load_records();  // (exec.c: saved recipes stay in the file the game rewrites; nothing is built here)
 }
 
 SDL_Window *ui_window(void) { return window; }
@@ -946,7 +1127,6 @@ SDL_Window *ui_window(void) { return window; }
 // Trirod-ShaderPrep (runtime/tools/shaderprep.c): what ui_window_init does for the game, minus the window, surface and
 // swapchain, so pipelines and SPIR-V land in the same caches for the same device. The device rule is the game's
 // (settings' GPU, else discrete > integrated > other) except that presenting can't be checked without a window.
-// The recorded warmup is left to the caller (vk_warm_start), which reports its progress.
 void vk_headless_init(void) {
     g_headless = true;
     settings_load();
@@ -969,16 +1149,201 @@ void vk_device_idle(void) {
     if (g_vk.dev) vkDeviceWaitIdle(g_vk.dev);
 }
 
+// ---- shader preparation in game, after a GPU or driver change (pipeline_cache_check decided: g_prep_in_game)
+// Setup runs Trirod-ShaderPrep before Play; choosing another GPU in the game's settings, or a driver update, leaves a
+// cache for the old one. Then the game runs the same tool itself before it starts (the game thread waits here, as
+// for the old startup warmup), shows its progress in the window (menu_set_progress) and merges the prepared cache into
+// its own. Esc / B ends the tool: the game starts and builds what it meets, as without preparation.
+#ifdef _WIN32
+// Is `exe` built with the same runtime as this game? ("Trirod-ShaderPrep <version> runtime <id> ..." from --version
+// against Trirod.exe.id, written beside the game when it was linked.) A data folder can hold a stale copy of the tool:
+// the user's first in-game preparation ran one from 09:19 that predated this code.
+static bool shaderprep_matches(const char *exe, const char *want) {
+    char log[1200], line[300], id[64];
+    snprintf(log, sizeof log, "%s/logs/shaderprep-version.txt", rt_data_root());
+    const char *argv[] = {exe, "--version", NULL};
+    PlatProc p = plat_spawn(argv, log, false);
+    if (!p || plat_proc_wait(p, true) != 0) return false;
+    FILE *f = fopen(log, "rb");
+    bool ok = f && fgets(line, sizeof line, f) && sscanf(line, "Trirod-ShaderPrep %*s runtime %63s", id) == 1 &&
+              !strcmp(id, want);
+    if (f) fclose(f);
+    if (!ok) LOG("[vk] %s is from another runtime build (wants %s): not used\n", exe, want);
+    return ok;
+}
+
+static bool find_shaderprep(char *out, size_t n) {
+    char want[64] = "", idp[1200];
+    if (!plat_exe_path(idp, sizeof idp - 4)) return false;
+    strcat(idp, ".id");
+    FILE *f = fopen(idp, "rb");
+    if (f) { if (fgets(want, sizeof want, f)) want[strcspn(want, "\r\n")] = 0; fclose(f); }
+    if (!want[0]) { LOG("[vk] %s missing: cannot tell which Trirod-ShaderPrep matches this game\n", idp); return false; }
+    // the install folder first (Play puts it first on PATH; Trirod.exe is in the data folder), then beside the game
+    const char *path = getenv("PATH");
+    struct stat st;
+    for (const char *p = path; p && *p;) {
+        const char *e = strchr(p, ';');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len && (size_t)snprintf(out, n, "%.*s\\Trirod-ShaderPrep.exe", (int)len, p) < n && stat(out, &st) == 0 &&
+            shaderprep_matches(out, want))
+            return true;
+        p = e ? e + 1 : p + len;
+    }
+    return rt_resource("Trirod-ShaderPrep.exe", NULL, out, n) && shaderprep_matches(out, want);
+}
+
+static bool merge_prepared_cache(void) {
+    char path[600];
+    snprintf(path, sizeof path, "%s/vk_pipelines.bin", vk_cache_dir());
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    size_t sz = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    void *data = malloc(sz ? sz : 1);
+    bool ok = fread(data, 1, sz, f) == sz;
+    fclose(f);
+    const VkPipelineCacheHeaderVersionOne *h = data;
+    ok = ok && sz >= sizeof *h && h->vendorID == g_vk.props.vendorID && h->deviceID == g_vk.props.deviceID &&
+         !memcmp(h->pipelineCacheUUID, g_vk.props.pipelineCacheUUID, VK_UUID_SIZE);
+    VkPipelineCache tmp = VK_NULL_HANDLE;
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = sz,
+                                    .pInitialData = data};
+    ok = ok && vkCreatePipelineCache(g_vk.dev, &ci, NULL, &tmp) == VK_SUCCESS &&
+         vkMergePipelineCaches(g_vk.dev, g_vk.pcache, 1, &tmp) == VK_SUCCESS;
+    if (tmp) vkDestroyPipelineCache(g_vk.dev, tmp, NULL);
+    free(data);
+    return ok;
+}
+
+static void prepare_shaders_in_game(void) {
+    if (!g_prep_in_game || g_headless) return;
+    char path[700], exe[1200], log[1200], title[200], detail[420] = "", text[320] = "", line[700];
+    snprintf(path, sizeof path, "%s/prep-attempt.txt", vk_cache_dir());  // (first: a crash doesn't retry every start)
+    FILE *f = fopen(path, "wb");
+    if (f) fprintf(f, "%s\n", g_prep_key), fclose(f);
+    snprintf(log, sizeof log, "%s/logs", rt_data_root());
+    mkdir(log, 0755);
+    if (!find_shaderprep(exe, sizeof exe)) {
+        LOG("[vk] %s; Trirod-ShaderPrep.exe not found (start the game with the launcher's Play): shaders are built "
+            "as the game meets them\n", g_prep_why);
+        return;
+    }
+    snprintf(log, sizeof log, "%s/logs", rt_data_root());
+    mkdir(log, 0755);
+    snprintf(log, sizeof log, "%s/logs/shaderprep-game.log", rt_data_root());
+    const char *argv[] = {exe, "--data", rt_data_root(), NULL};
+    PlatProc pr = plat_spawn(argv, log, false);
+    if (!pr) { LOG("[vk] could not start %s: shaders are built as the game meets them\n", exe); return; }
+    LOG("[vk] %s: preparing shaders for %s before the game starts (Esc / B skips; output in %s)\n", g_prep_why,
+        g_vk.props.deviceName, log);
+    snprintf(title, sizeof title, "Preparing shaders for %s", g_vk.props.deviceName);
+    snprintf(text, sizeof text, "Starting the shader preparation");
+    float fraction = 0;
+    long pos = 0;
+    int code = -1;
+    bool skipped = false;
+    uint64_t t0 = SDL_GetTicksNS();
+    static const float black[4] = {0, 0, 0, 1};
+    for (;;) {
+        code = plat_proc_wait(pr, false);
+        FILE *lf = fopen(log, "rb");
+        if (lf) {  // the tool's events (runtime/tools/protocol.h), whole lines only
+            fseek(lf, pos, SEEK_SET);
+            while (fgets(line, sizeof line, lf) && strchr(line, '\n')) {
+                pos = ftell(lf);
+                line[strcspn(line, "\r\n")] = 0;
+                float fr;
+                int k = 0;
+                if (sscanf(line, "@@progress %f %n", &fr, &k) == 1) {
+                    fraction = fr < 0 ? 0 : fr > 1 ? 1 : fr;
+                    if (k) snprintf(text, sizeof text, "%s", line + k);
+                } else if (!strncmp(line, "@@info ", 7) || !strncmp(line, "@@warn ", 7) || !strncmp(line, "@@error ", 8))
+                    LOG("[shaderprep] %s\n", line + 2);
+            }
+            fclose(lf);
+        }
+        uint64_t s = (SDL_GetTicksNS() - t0) / 1000000000ull;
+        snprintf(detail, sizeof detail, "%s.\n%s (%llu:%02llu)", g_prep_why, text, (unsigned long long)(s / 60),
+                 (unsigned long long)(s % 60));
+        menu_set_progress(title, detail, fraction);
+        if (code >= 0) break;
+        if (menu_progress_skipped()) { plat_proc_kill(pr); skipped = true; break; }
+        if (vk_frame_begin(black)) {
+            menu_render((void *)vk_cmd(), g_vk.sc_extent.width, g_vk.sc_extent.height);
+            vk_frame_end(NULL);
+        }
+        SDL_Delay(33);
+    }
+    menu_set_progress(NULL, NULL, -1);
+    double secs = (SDL_GetTicksNS() - t0) / 1e9;
+    if (skipped) LOG("[vk] shader preparation skipped after %.0f s: shaders are built as the game meets them\n", secs);
+    else if (code == 0 && merge_prepared_cache()) {
+        g_pc_prepared = true;  // (saved with "prepared 1" at exit)
+        stale_note(NULL);
+        LOG("[vk] shaders prepared for %s in %.0f s\n", g_vk.props.deviceName, secs);
+    } else LOG("[vk] shader preparation ended with status %d after %.0f s (see %s): shaders are built as the game "
+               "meets them\n", code, secs, log);
+}
+#else
+static void prepare_shaders_in_game(void) {}
+#endif
+
+// ---- the recorded complete pipelines, built before the game starts (as TOTK's "pipeline keys seen in play are built
+// at boot" and Triforce's precompile before the game starts)
+// Trirod-ShaderPrep only fills the driver's cache: each pipeline still needs its program translated (one serialized
+// translator thread) and vkCreateGraphicsPipelines called, and until then a draw that needs it is skipped. Without this
+// step, loading a save showed the scene's skipped draws as a black or half-drawn picture while each was built
+// (2026-11-24). With the caches prepared the build is quick: 164 recipes took 0.2 s in session 16b, and the same
+// scripted save load went from 440 skipped draws to 26. The panel shows only when it takes longer than a moment;
+// Esc / B starts the game anyway (the rest keeps building in the background, ahead of new pipelines' turn: they wait
+// for it, compile_wait "known"). EOWRECOMP_VK_WARM=0: no recipes; EOWRECOMP_VK_WARM_WAIT=<s>: longest wait (0: none).
+static void warm_boot(void) {
+    vk_warm_start();
+    int done = 0, total = 0;
+    if (!vk_warm_progress(&done, &total)) return;
+    const char *e = getenv("EOWRECOMP_VK_WARM_WAIT");
+    double limit = e && *e ? atof(e) : 180;
+    uint64_t t0 = SDL_GetTicksNS();
+    bool shown = false;
+    static const float black[4] = {0, 0, 0, 1};
+    char title[200], detail[200];
+    snprintf(title, sizeof title, "Loading shaders for %s", g_vk.props.deviceName);
+    while (vk_warm_progress(&done, &total)) {
+        double s = (SDL_GetTicksNS() - t0) / 1e9;
+        if (s >= limit) { LOG("[warm] still building after %.0f s: the game starts, the rest builds meanwhile\n", s); break; }
+        if (s > 0.3) {
+            VkWarmSummary w;
+            vk_warm_summary(&w);
+            snprintf(detail, sizeof detail, "Recorded pipelines: programs %d/%d, pipelines %d/%d", w.programs_done, w.programs,
+                     w.pipelines_done, w.pipelines);
+            menu_set_progress(title, detail, total ? (float)done / total : 0);
+            shown = true;
+            if (menu_progress_skipped()) { LOG("[warm] skipped after %.1f s: the rest builds meanwhile\n", s); break; }
+            if (vk_frame_begin(black)) {
+                menu_render((void *)vk_cmd(), g_vk.sc_extent.width, g_vk.sc_extent.height);
+                vk_frame_end(NULL);
+            }
+        }
+        SDL_Delay(16);
+    }
+    if (shown) menu_set_progress(NULL, NULL, -1);
+}
+
 void backend_init(void) {
     while (!atomic_load(&ui_ready)) SDL_Delay(1);
     LOG("[vk] %s, swapchain %ux%u\n", g_vk.props.deviceName, g_vk.sc_extent.width, g_vk.sc_extent.height);
-    extern void vk_warm_wait(void);
-    vk_warm_wait();  // (the shader warmup: the game starts once the recorded set is built)
+    prepare_shaders_in_game();
+    warm_boot();  // (after a preparation: its merged recipes are in cache/warm now)
 }
 
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
     if (!g_vk.dev) return;
+    extern void vk_exec_wait_jobs(void), vk_exec_drop_optimize_jobs(void);
+    vk_exec_drop_optimize_jobs();  // (queued optimized replacements are dropped, not waited for)
+    vk_exec_wait_jobs();  // no background shader or pipeline job may use objects while exec tables are reset
     vkDeviceWaitIdle(g_vk.dev);
     extern void vk_textures_reset(void);
     extern void vk_exec_reset(void);

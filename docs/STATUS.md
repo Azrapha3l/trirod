@@ -1,5 +1,152 @@
 # Status
 
+Atualizado: 2026-11-24 (GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+
+## Shared shader warm catalog (implemented; awaiting Windows build and install test)
+
+- `[local path omitted]` held 1,089 learned pipeline recipes. `tools/export_shader_warm.py` validated recipe
+  checksums and referenced guest-code hashes, then exported 1,089 unique recipes and 818 code records (about 5.7 MB)
+  into `shader_catalog\warm\`. This is the folder to update after future playthroughs.
+- The catalog uses recipe schema 2 with wildcard GPU IDs. Setup packages only `shader_catalog\warm\` under
+  `tools\shader_catalog\warm`; `Trirod-ShaderPrep` loads it with the player's local recipes, validates Vulkan format
+  support, rebuilds compatible pipelines on the player's GPU, and merges recipes/code into local `cache\warm`.
+- `cache\vk_pipelines.bin` stays per device/driver. ShaderPrep fills `cache\spirv`; `cache\glsl` is optional
+  diagnostic output (`EOWRECOMP_SAVE_GLSL_CACHE=1`). Neither is part of the shared catalog or release package.
+- Package checks allow only curated warm-catalog files under `tools\shader_catalog\warm`; other game data and opaque
+  driver-cache checks remain in place.
+- Built and run in the scratch data folder: 1089 bundled recipes plus local ones gave 1133 complete pipelines on the
+  test GPU, none skipped. The gain in familiar scenes is not yet measured in gameplay.
+
+## Shader preparation and GPL (2026-11-24): black-screen fix, cache identity, progress, GPU change — awaiting in-game confirmation
+
+**Black screen: root cause (reproduced and fixed here; not yet confirmed by the user in game).**
+- Reproduced in the scratch data folder on the test GPU, at the title screen (frame 900).
+- With GPL on, the frame was black: 720 draws per interval, **0 skipped**, so the GPL pipelines were bound and drew
+  nothing. With `EOWRECOMP_VK_GPL=0` (new switch), the title rendered.
+- The Khronos validation layer (`EOWRECOMP_VK_VALIDATION=1`) reported the cause: the background "optimized"
+  pipeline was a `LINK_TIME_OPTIMIZATION` link of four libraries created without
+  `RETAIN_LINK_TIME_OPTIMIZATION_INFO`. That is invalid usage, and once such a pipeline existed, `draw_` bound it.
+- Adding RETAIN fixed the picture, but the prepared `vk_pipelines.bin` grew to **1.19 GB**, from about 9 MB, because
+  the driver keeps the compiler input of ~15k shader-stage libraries.
+- Final design, as in DXVK:
+  - Libraries carry no RETAIN flag and are only fast-linked.
+  - The optimized replacement is the complete (monolithic) pipeline for the same key, built on a low-priority
+    worker (`exec.c` `optimize_gpl_pipeline` → `build_pipeline_mode(pp, true)`). `draw_` switches to it once it is
+    ready.
+- After the change, the title renders on a cold cache with GPL on and no validation messages. The cache was 3 MB
+  after 15 s.
+- The dynamic-state split (17 states across the four library types) matches the monolithic `DYN[]` list.
+- Fallback to monolithic pipelines when:
+  - GPL or fast linking is unavailable;
+  - polygon mode is wireframe;
+  - a library link fails (logged).
+
+**Cache identity.**
+- `vk_pipelines.bin` has a tag, `vk_pipelines.tag`: pipeline scheme 3, `prepared`, vendor, device, driver, GPU.
+- At start, `device.c` `pipeline_cache_check` compares the driver header (vendor, device, `pipelineCacheUUID`) and
+  the scheme. On a mismatch it starts an empty cache and writes the reason to `cache\shaders-stale.txt`.
+- Tested: the untagged cache from the black run was rejected as "the shader cache is from an older Trirod build".
+
+**Other bugs from the GPL change, fixed:**
+- **Recipes were being lost.** The game no longer runs the warmup, but `vk_warm_save` still rewrote `recipes.bin`
+  with only that session's recipes. On the user's PC, 1133 merged recipes became 126. The game now loads the saved
+  records at start without building them (`vk_warm_load_records`), so a save merges.
+- **Waits on exit and reboot.** Saving the cache waited for every shader job, including all queued optimized
+  pipelines. The cache is internally synchronized, so the save no longer waits; ShaderPrep waits itself, with
+  progress. A reboot drops queued optimized jobs before it waits.
+
+**ShaderPrep: what it builds, progress.**
+- The step shows one percentage over every unit of work, counted only when finished, with a line for the phase:
+  - recorded pipelines: programs prepared, complete pipelines created;
+  - game shader catalog: translated to SPIR-V, shader-stage libraries;
+  - optimizing pipelines: the background complete pipelines.
+- `@@info` lines say what was built and skipped, and why. `shaderprep.json` adds `optimized_pipelines` and
+  `optimized_queued`.
+- Complete pipelines come only from recipes, because the shader archives have no vertex formats, render targets or
+  blend state. The catalog provides SPIR-V plus, with GPL, per-pair shader-stage libraries. The game reuses those for
+  every draw state of the program by fast-linking them with small vertex-input and output libraries.
+- Scratch run on the test GPU, through the launcher's **Prepare shaders**, with the RETAIN build: 1333 s.
+  - recipes: 599/599 programs, 1133/1133 complete pipelines, none skipped;
+  - catalog: 7442/7442 translated to SPIR-V; 7405/7405 shader-stage library pairs;
+  - optimized: 1133/1133.
+
+  Final build:
+  - `Trirod.exe` ran the same preparation itself in 29 s (helped by NVIDIA's own driver shader cache from the
+    earlier run).
+  - Catalog only, into empty cache folders: 44 s and a **1.13 GB** `vk_pipelines.bin` with shader-stage
+    libraries; 39 s and 36 bytes without GPL. About 150 KB of driver cache per vertex+fragment pair: the cost
+    of prebuilding every stage library.
+  - Game start to frame 900: 21.8 s and 26.2 s with the prepared cache, 19.8 s with an empty one. The title
+    scene skipped the same 9 draws in its first interval either way, so its gain is not measured. Larger scenes
+    and how often the game's ShaderKey matches the catalog's plain-draw key are still to be measured.
+
+**GPU or driver change.**
+- When Setup has prepared shaders on this PC before (`cache\shaderprep.json` exists) but the cache doesn't match
+  the selected GPU, driver or scheme, `Trirod.exe` runs `Trirod-ShaderPrep` itself before the game starts. It shows
+  a progress panel in the window (`menu_set_progress`), then merges the prepared cache into its own
+  (`vkMergePipelineCaches`).
+- Esc, B or Back skips it. It runs once per device and driver (`cache\prep-attempt.txt`;
+  `EOWRECOMP_PREPARE_SHADERS=0/1`). Output: `logs\shaderprep-game.log`.
+- The launcher shows the stale reason under **Play** and offers **Prepare shaders** (`--prepare-shaders`).
+- There is one cache per data folder: switching back to the first GPU needs another preparation.
+
+**First-use black or half-drawn scenes (user report, save load into a house area, test GPU).**
+- **Cause.** The GPL change had removed the boot build of recorded pipelines from `Trirod.exe`.
+  - Setup's preparation only fills the driver cache. Every first draw of a session still waited for its program's
+    translation (one serialized thread) and `vkCreateGraphicsPipelines`, and was skipped meanwhile.
+  - `draw_` still looked for warm pipelines, but none existed, so the 1133 recipes were never used in game.
+- **How the user's frames came about.** Their log has no verbose counts, so this is inferred, not measured on their
+  PC. The image held by the 500 ms rule is the last complete frame, which on a load is the black transition. Once
+  the limit expired, frames were shown with the scene's material draws skipped: the silhouettes in their first
+  screenshot.
+- **Also found.** The user's in-game preparation ran a stale `Trirod-ShaderPrep.exe` from the data folder
+  (09:19, old report format). The tool is now taken from `PATH` first and only when its `--version` runtime ID
+  matches `Trirod.exe.id`.
+- **Changes, general (not only save loads):**
+  - Boot build of the recipes, with a panel and Esc / B to skip (`device.c` `warm_boot`).
+  - Optimized replacements on an idle queue tier, so they never delay a build something waits for.
+  - TOTK's one-shot rule: a draw into a target nothing drew into last frame waits instead of being skipped
+    (`EOWRECOMP_VK_ONESHOT_WAIT=0` turns it off).
+  - Compute dispatches wait up to 250 ms for their build (`EOWRECOMP_VK_COMPUTE_WAIT=0` turns it off).
+  - Session counters (`[vk] session pipelines: ...`): prepared, reused ready / still building, missed (new),
+    programs, and driver cache hits / compiles / fast links from `VK_PIPELINE_CREATION_FEEDBACK`.
+  - The hold still applies to anything skipped; with verbose output, the stats line shows queued shader jobs, and
+    every held stretch is logged.
+- **Measured.** Scratch data, a copy of the user's save, scripted load
+  (`EOWRECOMP_INPUT='2000:A:12,2600:A:12,3600:A:12,3800:UP:12,3950:A:12'`), each run from the same prepared cache:
+
+  | Run | Boot build | First draws | Programs | Driver in play | Skipped at the load | Held |
+  |---|---|---|---|---|---|---|
+  | before (boot build and waits off) | — | 136 missed | 79 new | 124 cache, 12 compiled | 270 (150 program, 114 pipeline, 6 compute) | 118 ms, 260 draws |
+  | after | 1133 in 2.2 s | 107 reused ready, 16 missed | 70 reused, 9 new | 4 cache, 12 compiled | 52 + 23 | 52 ms, 75 draws |
+  | after, 2nd session | 1149 in 1.9 s | 123 reused ready, 0 missed | 79 reused, 0 new | 0 compiled | **0** | none |
+
+  - The 16 misses of the first session were recorded and built at the next boot. That is the collection loop:
+    play, record, prepare, reuse.
+  - A cold boot build (no prepared cache) took 137 s before the idle tier existed. Setup's preparation is what keeps
+    it to seconds.
+- **Coverage, compared with the references.**
+  - Shader-stage libraries are not complete pipelines. The catalog gives SPIR-V and stage libraries for all 7405
+    pairs, but a pipeline also needs each draw's vertex formats, targets and blend state, which only recipes have.
+  - TOTK builds the pipeline keys seen in play at boot. Triforce records every pipeline's full description and
+    rebuilds all of them at start. Trirod now does the same from `cache\warm`: 1133 bundled-plus-local recipes, now
+    1149.
+  - What is still missing is breadth. The bundled catalog comes from one player's sessions. Each area someone plays
+    adds recipes locally. `tools/export_shader_warm.py` merges a data folder's `cache\warm` into
+    `shader_catalog\warm\`, the portable set Setup ships and prepares on each GPU.
+  - Draws whose program was never seen remain first-use builds. The slow part is the serialized Maxwell translator
+    plus the driver compile.
+  - Next steps worth measuring: a persistent translation cache (translated GLSL and its reflection data per code
+    hash and key), so a prepared program skips translation; and a hold limit tied to build progress rather than a
+    fixed 500 ms.
+
+**Not verified:**
+- the fix in the user's game on the test GPU;
+- whether the user's own save load is now clean (tested here only with a copy of their save, on scratch data);
+- gameplay beyond the scripted save load;
+- the Esc / B skip key on the preparation panel (only ending the tool was tested);
+- how long a full preparation takes on the user's PC.
+
 ## TODO
 
 **alpha_2 (2026-11-24, in preparation; alpha_1 is published at github.com/Azrapha3l/trirod).** Console and log
@@ -116,10 +263,12 @@ tool protocol is in `docs/TOOL-PROTOCOL.md`.
   `tools/windows/package.ps1` (the old installer) has not been updated.
 
 **Shader prewarm investigation (2026-11-23):** The matching local EoW v1.0.0 RomFS is available at `[local path omitted]`. Its `region_common/shader` folder contains 96 `.bfsha` archives (62,298,464 bytes total). Parsing their BNSH variation/program/stage tables found 247 BNSH containers, 11,892 program variations, and 3,576 unique stage records (35,278,429 bytes in the first per-stage-file output); all parsed records passed the control/code length and magic checks. `ExeFS/main` is also available (26,093,400 bytes), but direct BNSH scanning of the compressed NSO is not a complete scan of its decompressed sections. Do not use published v1.1.0 / SDK 20.5.1 counts as v1.0 inventory.
-- Intended workflow: Setup scans the user's installed game assets and creates a portable shader catalog from the Maxwell code and archive metadata. Gameplay adds code/variant/interface and pipeline-state combinations that static extraction cannot infer. On subsequent launches, the runtime translates catalog entries to this build's GLSL/SPIR-V and combines known runtime variants with the user's local Vulkan pipeline cache.
-- Implementation started: `tools/shader_catalog.py` extracts BNSH control/code stage records and paired stage identities to a compact portable catalog. `tools/gen.py --shader-catalog` exposes it through the same packaged helper Setup already uses. `runtime/gamebuild.c` invokes it once while building the user's game data; output is placed in `extracted/shader_catalog/` and removed with the rest of that game's files. This creates the asset catalog; runtime pretranslation and GPU-specific warm pipelines are the next integration step.
-- Current implementation gap: Vulkan `vk_warm_start` still reads only `cache/warm/code/` and `cache/warm/recipes.bin`, which are recorded from programs and pipelines encountered during gameplay. It does not yet consume the static catalog, translate a game-wide shader catalog, or seed compute programs. The on-disk Vulkan driver pipeline cache is local to each GPU/driver and cannot be distributed as a portable repository artifact.
-- Next shader work: implement the separate headless preparation tool, invoked by the launcher, to load the catalog, translate known Maxwell stages/program pairs to GLSL/SPIR-V, and build pipelines for recipes available from the game's archive metadata and runtime-learned catalog. Keep GPU/driver-specific pipeline caches local to each player; the Vulkan specification says incompatible pipeline-cache data is initialized empty, and its contents depend on implementation/device details. Measure setup duration, catalog size, warmup time, and whether static seeding reduces first-seen in-game stutter. Include compute shaders. Game shader archives do not reveal every dynamic render-state combination, so the tool cannot guarantee every pipeline is prebuilt from shader files alone.
+- Implemented: `tools/shader_catalog.py` extracts BNSH control/code stage records and paired stage identities. `tools/gen.py --shader-catalog` exposes it through the packaged helper, and `runtime/gamebuild.c` creates `extracted/shader_catalog/` from the user's own game files. `Trirod-ShaderPrep` now translates catalog vertex/fragment pairs and compute shaders to cached SPIR-V, then prepares complete GPU pipelines from local and bundled runtime recipes. Setup runs this headless tool before Play.
+- Coverage gap: shader archives identify shader code and program pairs, but not every runtime shader key or pipeline state (vertex formats, attachments, depth/blend state). ShaderPrep cannot build every final pipeline from archive data alone. Additional pipeline combinations are discovered during play and saved as portable recipes; the driver cache is rebuilt per GPU/driver.
+- Current first-use issue: the runtime still skips pending ordinary draws, and fullscreen/known-warm draws can still be skipped after their wait budget. ShaderPrep prepares known shader stages and recorded pipelines, but this policy can expose missing content when an unprepared combination is first encountered. `Trirod.exe` no longer repeats the batch recipe warmup at startup; it uses the driver's pipeline cache prepared by Setup and builds misses on demand.
+- Implemented in source on 2026-11-24: optional `VK_EXT_graphics_pipeline_library` support. ShaderPrep prepares reusable VS/pre-raster and FS libraries from catalog shader pairs into the player's GPU-specific cache. Gameplay combines those with per-state vertex-input and fragment-output libraries for a fast linked pipeline, then queues a link-time-optimized replacement in the background. The monolithic fallback remains for devices without GPL and wireframe pipelines. The build log reports whether GPL and driver fast linking are available.
+- Still needed: a target-aware wait/skip policy so an important render-to-texture producer is not discarded while its first-use program/pipeline is pending. Measure actual ShaderPrep duration, cache reuse, first-use waits, skipped draws, and dynamic-resolution artifacts. The translator remains serialized on one runtime thread; shaderc and pipeline work already use workers, so raising thread counts is not the first fix.
+- Verification: syntax-only Windows compilation passed for `device.c`, `exec.c`, and `shaderprep.c` (two pre-existing const warnings in warm-code loading). Full `setup/build.ps1` did not reach compilation because MSYS `make.exe` fails to create a named object (`NtCreateDirectoryObject ... 0xC0000022`), including with `-Jobs 1`. GPL must still be built, run through ShaderPrep, and validated in-game.
 - Public comparison only: a survey of EoW 1.1.0 reported 9,858 unique stages and also distinguished extracted shader-library records from a smaller runtime-recorded pipeline seed. That supports the two-source design conceptually, but its counts/manifest are not reusable for this v1.0.0 / SDK 16.2.0 build.
 
 Atualizado: 2026-11-23 (sessão 16c: árvores de Hyrule Town corrigidas — S2R lane id/máscaras + draws indiretos; sessão 16b: warmup de shaders/pipelines; sessão 16: Rift confirmado; Hyrule Town sem erros de validação; diagnósticos para o apoio invisível do pássaro).

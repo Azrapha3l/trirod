@@ -27,7 +27,11 @@ enum { SKIP_NO_PROGRAM, SKIP_PROG_PENDING, SKIP_PROG_FAILED, SKIP_PIPE_PENDING, 
 static const char *const skip_names[SKIP_NREASONS] = {"no program", "program compiling", "program failed",
     "pipeline compiling", "pipeline failed", "topology", "compute program", "skip list"};
 static uint64_t stat_skip_why[SKIP_NREASONS];
-#define SKIP(why) (stat_skipped++, stat_skip_why[why]++)
+// draws skipped since the last present because their program / pipeline was still building (backend_present holds
+// the previous image instead of showing a frame with holes: vk_frame_pending_skips)
+static uint32_t frame_pending_skips;
+#define SKIP(why) (stat_skipped++, stat_skip_why[why]++, frame_pending_skips += (why) == SKIP_PROG_PENDING || (why) == SKIP_PIPE_PENDING)
+uint32_t vk_frame_pending_skips(void) { uint32_t n = frame_pending_skips; frame_pending_skips = 0; return n; }
 static uint64_t stat_upload_bytes;
 // EOWRECOMP_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
@@ -612,14 +616,22 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
 // First-use compiles run off the render thread; draws needing them are skipped until ready (as on Metal).
 // EOWRECOMP_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
 typedef struct Job { void (*fn)(void *); void *arg; struct Job *next; } Job;
+static _Atomic uint32_t pending_jobs;
+static pthread_mutex_t pending_jobs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pending_jobs_cond = PTHREAD_COND_INITIALIZER;
 // Each queue has a second, low-priority list: the startup shader warmup (vk_warm_start) queues there, so builds the
 // game needs right now go first; a draw waiting for a warm build moves it to the front (jobs_bump).
-typedef struct { Job *head, *tail, *low_head, *low_tail; pthread_mutex_t lock; pthread_cond_t cond; } JobQueue;
+// And a third, idle list: the optimized (complete) replacements of fast-linked pipelines. They only make a working
+// pipeline faster, so they never delay a build something is waiting for: the startup warmup's pipelines waited behind
+// 1133 of them in a cold run (137 s instead of seconds).
+typedef struct { Job *head, *tail, *low_head, *low_tail, *idle_head, *idle_tail; pthread_mutex_t lock; pthread_cond_t cond; } JobQueue;
 static JobQueue jobs = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
 
-static void queue_push(JobQueue *q, Job *j, bool low) {
+static void queue_push(JobQueue *q, Job *j, int tier) {  // 0 now, 1 low (warmup), 2 idle (optimization)
+    atomic_fetch_add(&pending_jobs, 1);
     pthread_mutex_lock(&q->lock);
-    Job **head = low ? &q->low_head : &q->head, **tail = low ? &q->low_tail : &q->tail;
+    Job **head = tier == 2 ? &q->idle_head : tier ? &q->low_head : &q->head;
+    Job **tail = tier == 2 ? &q->idle_tail : tier ? &q->low_tail : &q->tail;
     if (*tail) (*tail)->next = j; else *head = j;
     *tail = j;
     pthread_cond_signal(&q->cond);
@@ -628,13 +640,50 @@ static void queue_push(JobQueue *q, Job *j, bool low) {
 
 static Job *queue_pop(JobQueue *q) {
     pthread_mutex_lock(&q->lock);
-    while (!q->head && !q->low_head) pthread_cond_wait(&q->cond, &q->lock);
-    bool low = !q->head;
-    Job *j = low ? q->low_head : q->head;
-    if (low) { q->low_head = j->next; if (!q->low_head) q->low_tail = NULL; }
-    else { q->head = j->next; if (!q->head) q->tail = NULL; }
+    while (!q->head && !q->low_head && !q->idle_head) pthread_cond_wait(&q->cond, &q->lock);
+    Job **head = q->head ? &q->head : q->low_head ? &q->low_head : &q->idle_head;
+    Job **tail = q->head ? &q->tail : q->low_head ? &q->low_tail : &q->idle_tail;
+    Job *j = *head;
+    *head = j->next;
+    if (!*head) *tail = NULL;
     pthread_mutex_unlock(&q->lock);
     return j;
+}
+
+static void queue_job_finished(void) {
+    if (atomic_fetch_sub(&pending_jobs, 1) == 1) {
+        pthread_mutex_lock(&pending_jobs_lock);
+        pthread_cond_broadcast(&pending_jobs_cond);
+        pthread_mutex_unlock(&pending_jobs_lock);
+    }
+}
+
+// backend_reset (tables cleared) and Trirod-ShaderPrep (all pipelines created before the cache is saved). Saving the
+// pipeline cache itself needs no wait: a VkPipelineCache created without EXTERNALLY_SYNCHRONIZED is thread-safe.
+void vk_exec_wait_jobs(void) {
+    pthread_mutex_lock(&pending_jobs_lock);
+    while (atomic_load(&pending_jobs)) pthread_cond_wait(&pending_jobs_cond, &pending_jobs_lock);
+    pthread_mutex_unlock(&pending_jobs_lock);
+}
+uint32_t vk_exec_jobs_pending(void) { return atomic_load(&pending_jobs); }
+
+// Drops the queued (not yet started) idle jobs that run `fn`, each passed to `drop` (backend_reset: the
+// optimized-pipeline replacements; the fast-linked pipelines they would replace already work).
+static void queue_drop_idle(JobQueue *q, void (*fn)(void *), void (*drop)(void *)) {
+    pthread_mutex_lock(&q->lock);
+    Job *prev = NULL, *j = q->idle_head;
+    while (j) {
+        Job *next = j->next;
+        if (j->fn == fn) {
+            if (prev) prev->next = next; else q->idle_head = next;
+            if (q->idle_tail == j) q->idle_tail = prev;
+            if (drop) drop(j->arg);
+            free(j);
+            queue_job_finished();
+        } else prev = j;
+        j = next;
+    }
+    pthread_mutex_unlock(&q->lock);
 }
 
 static void *worker(void *a) {
@@ -643,6 +692,7 @@ static void *worker(void *a) {
         Job *j = queue_pop(&jobs);
         j->fn(j->arg);
         free(j);
+        queue_job_finished();
     }
     return NULL;
 }
@@ -663,6 +713,7 @@ static void *translator(void *a) {
         Job *j = queue_pop(&tjobs);
         j->fn(j->arg);
         free(j);
+        queue_job_finished();
     }
     return NULL;
 }
@@ -707,15 +758,15 @@ static void start_workers(void) {
     if (n > 16) n = 16;
     for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
 }
-static void run_job_q(void (*fn)(void *), void *arg, bool low) {
+static void run_job_q(void (*fn)(void *), void *arg, int tier) {
     if (sync_shaders()) { fn(arg); return; }
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, start_workers);
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
-    queue_push(&jobs, j, low);
+    queue_push(&jobs, j, tier);
 }
-static void run_job(void (*fn)(void *), void *arg) { run_job_q(fn, arg, false); }
+static void run_job(void (*fn)(void *), void *arg) { run_job_q(fn, arg, 0); }
 
 // ================================================================== state
 typedef struct {
@@ -796,6 +847,20 @@ const char *renderer_stats(void) {
             if (stat_skip_why[i]) n += snprintf(stats_text + n, sizeof stats_text - n, " %s %llu", skip_names[i], (unsigned long long)stat_skip_why[i]);
     }
     memset(stat_skip_why, 0, sizeof stat_skip_why);
+    {   // the session's pipeline totals every 30 s (verbose; device.c logs them at exit too)
+        static uint64_t last_ns;
+        uint64_t now = SDL_GetTicksNS();
+        if (rt_verbose() && now - last_ns > 30000000000ull) {
+            char sum[512];
+            vk_pipeline_session_summary(sum, sizeof sum);
+            LOG("[vk] session %s\n", sum);
+            last_ns = now;
+        }
+    }
+    if (atomic_load(&pending_jobs)) {  // (translations, compiles and pipelines not finished yet, optimized ones included)
+        size_t n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | shader jobs queued %u", atomic_load(&pending_jobs));
+    }
     {   // the startup warmup and the pipelines first met this interval
         extern void warm_stats(char *out, size_t n);
         size_t n = strlen(stats_text);
@@ -1329,6 +1394,7 @@ typedef struct {
     int nbinds;
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
+    VkPipeline gpl_pre, gpl_frag; // reusable shader libraries when VK_EXT_graphics_pipeline_library is available
     bool vs_uses_vid;
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
@@ -1340,6 +1406,7 @@ static uint64_t glsl_source_hash(const char *src, int stage) {
 }
 
 static void save_glsl_source(uint64_t h, const char *src) {
+    if (!getenv("EOWRECOMP_SAVE_GLSL_CACHE")) return;
     char path[600], tmp[640];
     snprintf(path, sizeof path, "%s/glsl", vk_cache_dir());
     mkdir(path, 0755);
@@ -1362,6 +1429,91 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
     VkPipelineLayout l;
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
     return l;
+}
+
+#ifdef VK_EXT_graphics_pipeline_library
+// The libraries are only ever fast-linked (no LINK_TIME_OPTIMIZATION link, so no RETAIN info: optimize_gpl_pipeline).
+// Trirod-ShaderPrep creates the catalog's with these same flags, so the game's own creation finds them in the cache.
+#define GPL_LIB_FLAGS VK_PIPELINE_CREATE_LIBRARY_BIT_KHR
+static VkResult create_counted(VkGraphicsPipelineCreateInfo *ci, VkPipeline *out, int kind);
+static bool make_program_libraries(VkShaderModule vs, VkShaderModule fs, VkPipelineLayout layout, VkPipeline *pre_out,
+                                   VkPipeline *frag_out) {
+    if (!g_vk.graphics_pipeline_library || !g_vk.gpl_fast_linking) return false;
+    VkPipelineShaderStageCreateInfo vst = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                           .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"};
+    VkPipelineShaderStageCreateInfo fst = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                           .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main"};
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                            .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    const VkDynamicState pre_dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                      VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
+                                      VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
+    const VkDynamicState frag_dyn[] = {VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                       VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+                                       VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP};
+    VkPipelineDynamicStateCreateInfo pre_dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                               .dynamicStateCount = sizeof pre_dyn / sizeof pre_dyn[0], .pDynamicStates = pre_dyn};
+    VkPipelineDynamicStateCreateInfo frag_dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                                .dynamicStateCount = sizeof frag_dyn / sizeof frag_dyn[0], .pDynamicStates = frag_dyn};
+    VkGraphicsPipelineLibraryCreateInfoEXT pre_gpl = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+        .flags = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT};
+    VkGraphicsPipelineCreateInfo pre = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                        .pNext = &pre_gpl, .flags = GPL_LIB_FLAGS,
+                                        .stageCount = 1, .pStages = &vst, .pViewportState = &vp,
+                                        .pRasterizationState = &rs, .pDynamicState = &pre_dy, .layout = layout};
+    VkGraphicsPipelineLibraryCreateInfoEXT frag_gpl = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+        .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT};
+    VkGraphicsPipelineCreateInfo frag = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                         .pNext = &frag_gpl, .flags = GPL_LIB_FLAGS,
+                                         .stageCount = 1, .pStages = &fst, .pDepthStencilState = &ds,
+                                         .pDynamicState = &frag_dy, .layout = layout};
+    VkPipeline pre_lib = VK_NULL_HANDLE, frag_lib = VK_NULL_HANDLE;
+    VkResult a = create_counted(&pre, &pre_lib, 1);
+    VkResult b = a == VK_SUCCESS ? create_counted(&frag, &frag_lib, 1) : a;
+    if (a != VK_SUCCESS || b != VK_SUCCESS) {
+        if (pre_lib) vkDestroyPipeline(g_vk.dev, pre_lib, NULL);
+        if (frag_lib) vkDestroyPipeline(g_vk.dev, frag_lib, NULL);
+        return false;
+    }
+    *pre_out = pre_lib;
+    *frag_out = frag_lib;
+    return true;
+}
+#endif
+
+bool vk_gpl_available(void) { return g_vk.graphics_pipeline_library && g_vk.gpl_fast_linking; }
+
+// ShaderPrep uses the same translator and Vulkan driver cache as the game. Creating the reusable
+// shader-stage libraries here gives the driver compiled stage material before Play; runtime recreates
+// the small library handles from that cache and links them with the current draw's state.
+bool vk_gpl_prepare_spirv_pair(const uint32_t *vs_words, size_t vs_size, const uint32_t *fs_words, size_t fs_size) {
+#ifdef VK_EXT_graphics_pipeline_library
+    if (!vk_gpl_available() || !vs_words || !fs_words || !vs_size || !fs_size) return false;
+    VkBindingInfo bindings[MAX_BIND];
+    int nb = vk_reflect(vs_words, vs_size, bindings, MAX_BIND);
+    nb += vk_reflect(fs_words, fs_size, bindings + nb, MAX_BIND - nb);
+    Prog p = {.binds = {0}, .nbinds = nb};
+    memcpy(p.binds, bindings, (size_t)nb * sizeof bindings[0]);
+    VkPipelineLayout layout = make_layout(&p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    VkShaderModule vs = vk_module(vs_words, vs_size), fs = vk_module(fs_words, fs_size);
+    VkPipeline pre = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
+    bool ok = vs && fs && make_program_libraries(vs, fs, layout, &pre, &frag);
+    if (pre) vkDestroyPipeline(g_vk.dev, pre, NULL);
+    if (frag) vkDestroyPipeline(g_vk.dev, frag, NULL);
+    if (vs) vkDestroyShaderModule(g_vk.dev, vs, NULL);
+    if (fs) vkDestroyShaderModule(g_vk.dev, fs, NULL);
+    vkDestroyPipelineLayout(g_vk.dev, layout, NULL);
+    return ok;
+#else
+    (void)vs_words; (void)vs_size; (void)fs_words; (void)fs_size;
+    return false;
+#endif
 }
 
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
@@ -1394,6 +1546,47 @@ static void warm_save_code(const Prog *p);
 static void warm_code_ids(const NvnProgram *np, uint64_t gid[2], uint32_t gext[2]);
 static Prog *warm_prog_find(const uint64_t gid[2], const uint32_t gext[2], const ShaderKey *vkey, const ShaderKey *fkey);
 static uint64_t stat_warm_prog_hits, stat_warm_pipe_hits, stat_new_pipes;
+// The session's totals (vk_pipeline_session_summary). First draw of each pipeline / program: built from a recorded
+// recipe and already ready, or still building; or not in the recipes at all (missed: a new build, recorded for the
+// next preparation). Driver side, from VK_PIPELINE_CREATION_FEEDBACK (core 1.3): each vkCreateGraphicsPipelines that
+// came out of the pipeline cache (prepared by Setup or saved by an earlier run) or had to be compiled.
+static struct {
+    uint64_t reused_ready, reused_building, missed, prog_reused, prog_missed;
+    _Atomic uint64_t cache_hit, compiled, linked, lib_hit, lib_compiled;
+} sess;
+
+// vkCreateGraphicsPipelines for one pipeline, counted: kind 0 a complete pipeline, 1 a shader-stage library, 2 a fast
+// link of libraries (not a compile)
+static VkResult create_counted(VkGraphicsPipelineCreateInfo *ci, VkPipeline *out, int kind) {
+    VkPipelineCreationFeedback fb = {0};
+    VkPipelineCreationFeedbackCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+                                               .pNext = ci->pNext, .pPipelineCreationFeedback = &fb};
+    const void *next = ci->pNext;
+    ci->pNext = &fi;
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, ci, NULL, out);
+    ci->pNext = next;
+    if (r != VK_SUCCESS) return r;
+    bool hit = (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+               (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT);
+    if (kind == 2) atomic_fetch_add(&sess.linked, 1);
+    else if (kind == 1) atomic_fetch_add(hit ? &sess.lib_hit : &sess.lib_compiled, 1);
+    else atomic_fetch_add(hit ? &sess.cache_hit : &sess.compiled, 1);
+    return r;
+}
+
+// "prepared" (recipes built at the start), first draws, the driver's cache: one line, for the fps log and the exit
+void vk_pipeline_session_summary(char *out, size_t n) {
+    VkWarmSummary w;
+    vk_warm_summary(&w);
+    snprintf(out, n, "pipelines: %d prepared from recipes (%d built); first draws: %llu reused ready, %llu reused still "
+             "building, %llu missed (new); programs %llu reused, %llu new; driver: %llu from cache, %llu compiled, %llu "
+             "fast-linked; stage libraries %llu from cache, %llu compiled",
+             w.pipelines, w.pipelines_ok, (unsigned long long)sess.reused_ready, (unsigned long long)sess.reused_building,
+             (unsigned long long)sess.missed, (unsigned long long)sess.prog_reused, (unsigned long long)sess.prog_missed,
+             (unsigned long long)atomic_load(&sess.cache_hit), (unsigned long long)atomic_load(&sess.compiled),
+             (unsigned long long)atomic_load(&sess.linked), (unsigned long long)atomic_load(&sess.lib_hit),
+             (unsigned long long)atomic_load(&sess.lib_compiled));
+}
 
 static void compile_program(void *arg) {
     Prog *p = arg;
@@ -1440,6 +1633,11 @@ static void compile_program(void *arg) {
     free(sv);
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+#ifdef VK_EXT_graphics_pipeline_library
+    if (p->vs && p->fs && vk_gpl_available() &&
+        !make_program_libraries(p->vs, p->fs, p->layout, &p->gpl_pre, &p->gpl_frag))
+        LOG("[vk] shader-library creation failed; using monolithic pipeline fallback\n");
+#endif
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
     warm_prog_done(p);
@@ -1503,8 +1701,10 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
         prog_tab[slot].key = h;
         prog_tab[slot].prog = w;
         stat_warm_prog_hits++;
+        sess.prog_reused++;
         return w;
     }
+    sess.prog_missed++;
     Prog *p = calloc(1, sizeof *p);
     prog_tab[slot].key = h;
     prog_tab[slot].prog = p;
@@ -1706,7 +1906,13 @@ typedef struct {
     uint32_t write_mask[8];
 } PipeKey;
 
-typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; bool warm; } Pipe;  // state: 0 building, 1 ready, 2 failed
+typedef struct {
+    PipeKey k;
+    uint64_t hash;
+    VkPipeline pipe, optimized, gpl_vi, gpl_fo;
+    _Atomic int state, optimized_state;
+    bool warm;
+} Pipe;  // state: 0 building, 1 ready, 2 failed
 #define PIPE_TAB 65536
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
 
@@ -1737,8 +1943,36 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
     return c == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : c == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
-static void build_pipeline(void *arg) {
-    Pipe *pp = arg;
+// Optimized (complete, monolithic) replacements queued and finished: Trirod-ShaderPrep reports them as a stage of their own.
+static _Atomic int gpl_opt_queued, gpl_opt_done, gpl_opt_ok;
+void vk_gpl_optimize_progress(int *done, int *ok, int *total) {
+    *done = atomic_load(&gpl_opt_done);
+    *ok = atomic_load(&gpl_opt_ok);
+    *total = atomic_load(&gpl_opt_queued);
+}
+
+#ifdef VK_EXT_graphics_pipeline_library
+static void optimize_dropped(void *arg) {
+    atomic_store(&((Pipe *)arg)->optimized_state, 2);  // (keeps the fast-linked pipeline)
+    atomic_fetch_add(&gpl_opt_done, 1);
+}
+static void optimize_gpl_pipeline(void *arg);
+void vk_exec_drop_optimize_jobs(void) { queue_drop_idle(&jobs, optimize_gpl_pipeline, optimize_dropped); }
+
+// The optimized replacement of a fast-linked pipeline is the complete (monolithic) pipeline for the same key, built on
+// a low-priority worker from the program's shader modules, as DXVK does. Not a link-time-optimized link of the four
+// libraries: that needs every library created with RETAIN_LINK_TIME_OPTIMIZATION_INFO, which made the prepared
+// vk_pipelines.bin 1.19 GB instead of ~9 MB (15k shader-stage libraries keeping their compiler input). Without RETAIN
+// such a link is invalid usage, and on NVIDIA its pipelines drew nothing: the black title screen of 2026-11-24.
+static void build_pipeline_mode(Pipe *pp, bool optimize);
+static void optimize_gpl_pipeline(void *arg) { build_pipeline_mode(arg, true); }
+#else
+void vk_exec_drop_optimize_jobs(void) {}
+#endif
+
+static void build_pipeline(void *arg) { build_pipeline_mode(arg, false); }
+
+static void build_pipeline_mode(Pipe *pp, bool optimize) {
     PipeKey *k = &pp->k;
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
@@ -1789,11 +2023,78 @@ static void build_pipeline(void *arg) {
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor,
                                         .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth,
                                         .stencilAttachmentFormat = k->stencil};
+#ifdef VK_EXT_graphics_pipeline_library
+    // Polygon mode is part of the pre-raster subset. The common fill mode reuses the per-program
+    // pre-raster library; the uncommon wireframe mode stays on the exact monolithic path.
+    if (!optimize && vk_gpl_available() && k->poly_fill && k->prog->gpl_pre && k->prog->gpl_frag) {
+        const VkDynamicState vi_dyn[] = {VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+        const VkDynamicState fo_dyn[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        VkPipelineDynamicStateCreateInfo vi_dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                                  .dynamicStateCount = sizeof vi_dyn / sizeof vi_dyn[0], .pDynamicStates = vi_dyn};
+        VkPipelineDynamicStateCreateInfo fo_dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                                  .dynamicStateCount = sizeof fo_dyn / sizeof fo_dyn[0], .pDynamicStates = fo_dyn};
+        VkGraphicsPipelineLibraryCreateInfoEXT vi_gpl = {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            .flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT};
+        VkGraphicsPipelineCreateInfo vi_pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                              .pNext = &vi_gpl, .flags = GPL_LIB_FLAGS,
+                                              .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+                                              .pDynamicState = &vi_dy, .layout = k->prog->layout};
+        VkGraphicsPipelineLibraryCreateInfoEXT fo_gpl = {
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            .pNext = &ri, .flags = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
+        VkGraphicsPipelineCreateInfo fo_pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                              .pNext = &fo_gpl, .flags = GPL_LIB_FLAGS,
+                                              .pMultisampleState = &ms, .pColorBlendState = &cb,
+                                              .pDynamicState = &fo_dy, .layout = k->prog->layout};
+        VkPipeline libs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+        VkResult lr = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &vi_pi, NULL, &libs[0]);
+        if (lr == VK_SUCCESS) lr = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &fo_pi, NULL, &libs[1]);
+        if (lr == VK_SUCCESS) {
+            VkPipeline all[4] = {libs[0], k->prog->gpl_pre, k->prog->gpl_frag, libs[1]};
+            VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                                                 .libraryCount = 4, .pLibraries = all};
+            ri.pNext = &li;
+            VkGraphicsPipelineCreateInfo link = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                                                 .pNext = &ri, .layout = k->prog->layout};
+            lr = create_counted(&link, &pp->pipe, 2);
+        }
+        if (lr != VK_SUCCESS) {
+            if (libs[0]) vkDestroyPipeline(g_vk.dev, libs[0], NULL);
+            if (libs[1]) vkDestroyPipeline(g_vk.dev, libs[1], NULL);
+            if (pp->pipe) vkDestroyPipeline(g_vk.dev, pp->pipe, NULL);
+            pp->pipe = VK_NULL_HANDLE;
+            static _Atomic int ngpl;
+            if (atomic_fetch_add(&ngpl, 1) < 10) LOG("[vk] pipeline-library link failed: %d; retrying monolithic\n", lr);
+        } else {
+            pp->gpl_vi = libs[0];
+            pp->gpl_fo = libs[1];
+            atomic_fetch_add(&stat_compiles, 1);
+            atomic_store(&pp->state, 1);
+            static int lto = -1;  // EOWRECOMP_VK_GPL_OPTIMIZE=0: keep the fast-linked pipeline (no optimized replacement)
+            if (lto < 0) lto = !(getenv("EOWRECOMP_VK_GPL_OPTIMIZE") && atoi(getenv("EOWRECOMP_VK_GPL_OPTIMIZE")) == 0);
+            if (lto) atomic_fetch_add(&gpl_opt_queued, 1), run_job_q(optimize_gpl_pipeline, pp, 2);
+            if (pp->warm) { extern void warm_pipe_done(bool ok); warm_pipe_done(true); }
+            return;
+        }
+    }
+#endif
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
-    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    if (optimize) {  // (optimize_gpl_pipeline: draw_ binds it once optimized_state is 1)
+        VkPipeline opt = VK_NULL_HANDLE;
+        VkResult r = create_counted(&pi, &opt, 0);
+        if (r != VK_SUCCESS) {
+            static _Atomic int n;
+            if (atomic_fetch_add(&n, 1) < 10) LOG("[vk] optimized pipeline creation failed: %d; keeping the fast-linked one\n", r);
+        } else pp->optimized = opt, atomic_fetch_add(&gpl_opt_ok, 1);
+        atomic_store(&pp->optimized_state, r == VK_SUCCESS ? 1 : 2);
+        atomic_fetch_add(&gpl_opt_done, 1);
+        return;
+    }
+    VkResult r = create_counted(&pi, &pp->pipe, 0);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -1817,18 +2118,18 @@ static void build_pipeline(void *arg) {
 // skipped 1684 draws in two seconds, and a skipped draw that fed a later pass flashed black. The warmup records what a
 // run builds and rebuilds it at the next start, before the game runs:
 //  - <cache>/warm/code/<id>-<bytes>.bin: the guest VS / FS code the translator reads (maxwell_code_extent bytes),
-//    named by its content hash. Game data: it stays in the player's cache folder, never in the repository.
+//    named by its content hash. A curated, portable seed set may ship under tools/shader_catalog/warm; its code
+//    records are copied into the player's cache as they are loaded.
 //  - <cache>/warm/recipes.bin: one record per pipeline - the two code ids and sizes, both shader keys and every PipeKey
-//    field, written field by field (no pointers, handles or raw structs) with a checksum. Header: magic, schema,
-//    record size, and the GPU's vendor / device id (render-target, depth and vertex formats are chosen per device).
-// vk_warm_start (device start-up) translates each recorded program from its cached code and creates its pipelines on
-// the low-priority queues; backend_init waits for the set (vk_warm_wait; the window title shows the progress). Then
-// get_program finds a warm program by its code's content (guest addresses differ between runs) and draw_ finds the warm
-// pipeline under the same key hash it would build. A record that is corrupt, for another GPU, without its code, or
-// that no longer matches the translated shader is skipped: that draw builds as before. The translator version is not
-// part of the key: warm programs are translated by this build's translator, like any other.
-// EOWRECOMP_VK_WARM=0: no warmup and no recording. EOWRECOMP_VK_WARM_WAIT=0: start the game while it builds.
-#define WARM_SCHEMA 1
+//    field, written field by field (no pointers, handles or raw structs) with a checksum. Local files are tagged with
+//    the GPU's vendor / device id. Shared schema-2 catalogs use zero IDs; each device validates formats and rebuilds
+//    compatible pipelines with its own driver.
+// Trirod-ShaderPrep calls vk_warm_start to translate recorded programs and create their pipelines before Play. The game
+// loads the resulting driver's pipeline cache and builds any missing pipeline on demand. The runtime still records new
+// recipes for a later Setup run. A record that is corrupt, lacks code, or no longer matches the translated shader is
+// ignored by ShaderPrep. The translator version is not part of the key: every warm program uses the current translator.
+// EOWRECOMP_VK_WARM=0: disable recipe preparation / recording (used by ShaderPrep and diagnostics).
+#define WARM_SCHEMA 2
 #define WARM_PAYLOAD 800             // record: code ids and sizes (24), vertex / fragment keys (2 x 50), PipeKey (676)
 #define WARM_REC (WARM_PAYLOAD + 8)  // + checksum
 #define WARM_MAX 65536               // records kept
@@ -1991,6 +2292,11 @@ static uint32_t nrecs, cap_recs;
 static uint64_t rec_set[WARM_MAX * 2];  // payload hashes
 static bool rec_dirty;
 static uint64_t rec_saved_ns;
+static char warm_catalog_dir[1024];
+
+void vk_warm_catalog_set(const char *dir) {
+    snprintf(warm_catalog_dir, sizeof warm_catalog_dir, "%s", dir && *dir ? dir : "");
+}
 
 static bool rec_add_locked(const uint8_t *rec) {
     uint64_t h = fnv64(0xcbf29ce484222325ull, rec, WARM_PAYLOAD);
@@ -2159,26 +2465,44 @@ bool vk_warm_progress(int *done, int *total) {
     return *done < *total;
 }
 
-// backend_init: the game starts once the warm set is built (a black window meanwhile, the progress in its title).
-void vk_warm_wait(void) {
-    if (!warm_active) return;
-    const char *e = getenv("EOWRECOMP_VK_WARM_WAIT");
-    if (e && atoi(e) == 0) { LOG("[warm] EOWRECOMP_VK_WARM_WAIT=0: the game starts while the warmup builds\n"); return; }
-    int done, total;
-    uint64_t t0 = SDL_GetTicksNS(), last = t0;
-    while (vk_warm_progress(&done, &total)) {
-        uint64_t now = SDL_GetTicksNS();
-        if (now - t0 > 180000000000ull) { LOG("[warm] still building after 3 minutes: starting the game\n"); return; }
-        if (now - last > 2000000000ull) { LOG("[warm] preparing shaders: %d of %d\n", done, total); last = now; }
-        SDL_Delay(20);
-    }
-}
-
 static void *warm_enqueue(void *a) {  // (EOWRECOMP_SYNC_SHADERS: these run inline, so not on the UI thread)
     (void)a;
     for (int i = 0; i < WARM_PROG_TAB; i++)
         if (warm_progs[i].key) run_translate_q(translate_program, warm_progs[i].p, true);
     return NULL;
+}
+
+static uint8_t *warm_code_read(const char *path, uint64_t gid, uint32_t ext) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t *code = malloc(ext ? ext : 1);
+    bool ok = code && fread(code, 1, ext, f) == ext && fgetc(f) == EOF;
+    fclose(f);
+    if (ok && warm_code_id(code, ext) != gid) ok = false;
+    if (!ok) { free(code); return NULL; }
+    return code;
+}
+
+static void warm_code_cache_shared(uint64_t gid, uint32_t ext, const uint8_t *code) {
+    char dir[700], path[800], tmp[840];
+    snprintf(dir, sizeof dir, "%s/warm", vk_cache_dir());
+    mkdir(dir, 0755);
+    snprintf(dir, sizeof dir, "%s/warm/code", vk_cache_dir());
+    mkdir(dir, 0755);
+    snprintf(path, sizeof path, "%s/%016llx-%x.bin", dir, (unsigned long long)gid, ext);
+    FILE *existing = fopen(path, "rb");
+    if (existing) {
+        fclose(existing);
+        const uint8_t *cached = warm_code_read(path, gid, ext);
+        if (cached) { free((void *)cached); return; }
+        remove(path);  // replace a corrupt local copy with the verified bundled code
+    }
+    snprintf(tmp, sizeof tmp, "%s.%llx.tmp", path, (unsigned long long)SDL_GetTicksNS());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    bool ok = fwrite(code, 1, ext, f) == ext;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp, path) != 0) remove(tmp);
 }
 
 static const uint8_t *warm_code_load(uint64_t gid, uint32_t ext) {
@@ -2189,15 +2513,14 @@ static const uint8_t *warm_code_load(uint64_t gid, uint32_t ext) {
     tab[i].tried = true;
     tab[i].gid = gid;
     tab[i].ext = ext;
-    char path[640];
+    char path[1100];
     snprintf(path, sizeof path, "%s/warm/code/%016llx-%x.bin", vk_cache_dir(), (unsigned long long)gid, ext);
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    uint8_t *code = malloc(ext ? ext : 1);
-    bool ok = code && fread(code, 1, ext, f) == ext && fgetc(f) == EOF;
-    fclose(f);
-    if (ok && warm_code_id(code, ext) != gid) ok = false;  // (a damaged file)
-    if (!ok) { free(code); return NULL; }
+    uint8_t *code = warm_code_read(path, gid, ext);
+    if (!code && warm_catalog_dir[0]) {
+        snprintf(path, sizeof path, "%s/code/%016llx-%x.bin", warm_catalog_dir, (unsigned long long)gid, ext);
+        code = warm_code_read(path, gid, ext);
+        if (code) warm_code_cache_shared(gid, ext, code);
+    }
     return tab[i].code = code;
 }
 
@@ -2225,18 +2548,52 @@ static Prog *warm_prog_get(const uint64_t gid[2], const uint32_t gext[2], const 
     return p;
 }
 
-// Device start-up (UI thread, before the game runs): load the recipes and queue the warm set.
-void vk_warm_start(void) {
-    if (warm_off()) { LOG("[warm] off (EOWRECOMP_VK_WARM=0)\n"); return; }
-    uint64_t t0 = SDL_GetTicksNS();
+typedef struct { Prog *p; PipeKey k; } WarmTmp;
+
+// The game (ui_window_init): the recipes already saved, kept for the next vk_warm_save without building anything.
+// Since the game no longer runs the warmup itself (Trirod-ShaderPrep does), a save wrote only the recipes this run
+// had met: the 1133 recipes ShaderPrep had merged into the cache became 126 after one session ("[warm] saved 126
+// pipeline recipes", 2026-11-24). Records of another GPU are kept too (Trirod-ShaderPrep checks each recipe's formats
+// on the device it prepares for); the file is tagged for this GPU when saved.
+void vk_warm_load_records(void) {
+    if (warm_off()) return;
     char path[640];
     snprintf(path, sizeof path, "%s/warm/recipes.bin", vk_cache_dir());
     FILE *f = fopen(path, "rb");
-    if (!f) {
-        snprintf(warm_read.why, sizeof warm_read.why, "no recipes recorded yet");
-        LOG("[warm] no pipeline recipes yet: this run records them for the next start\n");
-        return;
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *data = size >= 32 ? malloc((size_t)size) : NULL;
+    bool ok = data && fread(data, 1, (size_t)size, f) == (size_t)size;
+    fclose(f);
+    uint32_t hv[5] = {0};
+    if (ok) memcpy(hv, data + 8, sizeof hv);
+    ok = ok && !memcmp(data, "EOWWARM", 8) && (hv[0] == 1 || hv[0] == WARM_SCHEMA) && hv[1] == WARM_REC;
+    uint32_t kept = 0, bad = 0;
+    if (ok) {
+        uint32_t count = hv[4], fit = (uint32_t)((size - 32) / WARM_REC);
+        if (count > fit) count = fit;
+        pthread_mutex_lock(&rec_lock);
+        for (uint32_t n = 0; n < count; n++) {
+            const uint8_t *rec = data + 32 + (size_t)n * WARM_REC;
+            uint64_t c;
+            memcpy(&c, rec + WARM_PAYLOAD, 8);
+            if (c != fnv64(0x84222325cbf29ce4ull, rec, WARM_PAYLOAD)) { bad++; continue; }
+            kept += rec_add_locked(rec);
+        }
+        rec_dirty = false;  // (only new recipes make a save necessary)
+        pthread_mutex_unlock(&rec_lock);
     }
+    free(data);
+    LOG("[warm] %u saved pipeline recipes kept for the next save%s\n", kept, ok ? "" : " (unreadable recipe file)");
+    (void)bad;
+}
+
+static bool warm_load_file(const char *path, bool shared, WarmTmp **tmp, int *ntmp, int *tmpcap,
+                           int *bad, int *missing, uint32_t *read_count) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -2245,20 +2602,21 @@ void vk_warm_start(void) {
     fclose(f);
     uint32_t hv[5] = {0};
     if (read_ok) memcpy(hv, data + 8, sizeof hv);
+    bool local_match = (hv[2] == g_vk.props.vendorID && hv[3] == g_vk.props.deviceID);
+    bool portable = hv[0] == 2 && !hv[2] && !hv[3];
     const char *why = !read_ok ? "unreadable" : memcmp(data, "EOWWARM", 8) ? "not a recipe file"
-                    : hv[0] != WARM_SCHEMA || hv[1] != WARM_REC ? "older format"
-                    : hv[2] != g_vk.props.vendorID || hv[3] != g_vk.props.deviceID ? "recorded on another GPU" : NULL;
+                    : (hv[0] != 1 && hv[0] != WARM_SCHEMA) || hv[1] != WARM_REC ? "unsupported recipe format"
+                    : (shared ? !portable : (!local_match && !portable)) ? "recorded for another GPU" : NULL;
     if (why) {
-        snprintf(warm_read.why, sizeof warm_read.why, "%s", why);
-        LOG("[warm] %s: %s; starting a new set\n", path, why);
+        LOG("[warm] %s: %s; ignoring this recipe set\n", path, why);
         free(data);
-        return;
+        return false;
     }
     uint32_t count = hv[4], fit = (uint32_t)((size - 32) / WARM_REC);
-    if (count > fit) count = fit;  // (a short file: what is there)
-    typedef struct { Prog *p; PipeKey k; } Tmp;
-    Tmp *tmp = malloc(sizeof(Tmp) * (count ? count : 1));
-    int ntmp = 0, bad = 0, missing = 0;
+    if (count > fit) count = fit;
+    if (count > WARM_MAX) count = WARM_MAX;
+    *read_count += count;
+    if (shared) warm_read.shared_recipes += count;
     for (uint32_t n = 0; n < count; n++) {
         const uint8_t *rec = data + 32 + (size_t)n * WARM_REC, *r = rec;
         uint64_t c;
@@ -2267,29 +2625,60 @@ void vk_warm_start(void) {
         uint32_t gext[2];
         ShaderKey vk, fk;
         PipeKey k;
-        if (c != fnv64(0x84222325cbf29ce4ull, rec, WARM_PAYLOAD)) { bad++; continue; }
+        if (c != fnv64(0x84222325cbf29ce4ull, rec, WARM_PAYLOAD)) { (*bad)++; continue; }
         wget(&r, gid, 16);
         wget(&r, gext, 8);
         if (!gid[0] || !gid[1] || !gext[0] || !gext[1] || gext[0] > 0x10000 || gext[1] > 0x10000 ||
-            !get_skey(&r, &vk) || !get_skey(&r, &fk) || !get_pkey(&r, &k)) { bad++; continue; }
+            !get_skey(&r, &vk) || !get_skey(&r, &fk) || !get_pkey(&r, &k)) { (*bad)++; continue; }
         pthread_mutex_lock(&rec_lock);
-        rec_add_locked(rec);  // (kept for the next save, also while its code is missing)
+        bool added = rec_add_locked(rec);  // (merged into this player's device-tagged cache on save)
+        if (shared && added) rec_dirty = true;
         pthread_mutex_unlock(&rec_lock);
         warm_read.flip_y[vk.flip_y ? 1 : 0]++;
         warm_read.depth_minus_one[vk.depth_minus_one ? 1 : 0]++;
         const uint8_t *code[2] = {warm_code_load(gid[0], gext[0]), warm_code_load(gid[1], gext[1])};
-        if (!code[0] || !code[1]) { missing++; continue; }
+        if (!code[0] || !code[1]) { (*missing)++; continue; }
         Prog *p = warm_prog_get(gid, gext, &vk, &fk, code);
-        if (!p) { missing++; continue; }
-        if (fk.stencil_tex) {  // (draw_ first looks the program up without stencil slots, to find them)
+        if (!p) { (*missing)++; continue; }
+        if (fk.stencil_tex) {
             ShaderKey base = fk;
             base.stencil_tex = 0;
             warm_prog_get(gid, gext, &vk, &base, code);
         }
-        tmp[ntmp].p = p;
-        tmp[ntmp++].k = k;
+        if (*ntmp >= WARM_MAX) { (*bad)++; continue; }
+        if (*ntmp == *tmpcap) {
+            int cap = *tmpcap ? *tmpcap * 2 : 256;
+            if (cap > WARM_MAX) cap = WARM_MAX;
+            WarmTmp *grown = realloc(*tmp, sizeof **tmp * cap);
+            if (!grown) { (*bad)++; continue; }
+            *tmp = grown;
+            *tmpcap = cap;
+        }
+        (*tmp)[*ntmp].p = p;
+        (*tmp)[(*ntmp)++].k = k;
     }
     free(data);
+    return true;
+}
+
+// Device start-up (UI thread, before the game runs): load the recipes and queue the warm set.
+void vk_warm_start(void) {
+    if (warm_off()) { LOG("[warm] off (EOWRECOMP_VK_WARM=0)\n"); return; }
+    uint64_t t0 = SDL_GetTicksNS();
+    char local[700], shared[1200];
+    snprintf(local, sizeof local, "%s/warm/recipes.bin", vk_cache_dir());
+    snprintf(shared, sizeof shared, "%s/recipes.bin", warm_catalog_dir);
+    WarmTmp *tmp = NULL;
+    int ntmp = 0, tmpcap = 0, bad = 0, missing = 0;
+    uint32_t count = 0;
+    bool found = warm_load_file(local, false, &tmp, &ntmp, &tmpcap, &bad, &missing, &count);
+    if (warm_catalog_dir[0]) found |= warm_load_file(shared, true, &tmp, &ntmp, &tmpcap, &bad, &missing, &count);
+    if (!found) {
+        snprintf(warm_read.why, sizeof warm_read.why, "no compatible local or bundled recipes");
+        LOG("[warm] no compatible pipeline recipes yet: this run records them for the next start\n");
+        free(tmp);
+        return;
+    }
     // pipelines grouped by program (warm_prog_done queues a program's range), each under draw_'s own key hash
     warm_pipes = calloc(ntmp ? ntmp : 1, sizeof *warm_pipes);
     for (int i = 0; i < WARM_PROG_TAB; i++) {
@@ -2321,8 +2710,8 @@ void vk_warm_start(void) {
     warm_read.pipelines = warm_npipes;
     warm_read.missing_code = missing;
     warm_read.invalid = bad;
-    LOG("[warm] %u recipes: %d programs and %d pipelines to build (%d without cached code, %d invalid), read in %.0f ms\n",
-        count, warm_nprogs, warm_npipes, missing, bad, (SDL_GetTicksNS() - t0) / 1e6);
+    LOG("[warm] %u recipes (%u shared): %d programs and %d pipelines to build (%d without cached code, %d invalid), read in %.0f ms\n",
+        count, warm_read.shared_recipes, warm_nprogs, warm_npipes, missing, bad, (SDL_GetTicksNS() - t0) / 1e6);
     if (!warm_nprogs) return;
     warm_active = true;
     warm_t0 = SDL_GetTicksNS();
@@ -3725,6 +4114,19 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
+    if (cp && atomic_load(&cp->p.state) == 0) {
+        // A skipped dispatch leaves its output unwritten, and compute results feed later passes (session 16b: the 24
+        // dispatches still skipped after the warmup). The game has 37 compute shaders; with the SPIR-V and driver
+        // caches prepared their build takes milliseconds, so the dispatch waits for it (moved to the front), up to
+        // 250 ms. EOWRECOMP_VK_COMPUTE_WAIT=0: skip as before.
+        static int on = -1;
+        if (on < 0) on = !(getenv("EOWRECOMP_VK_COMPUTE_WAIT") && atoi(getenv("EOWRECOMP_VK_COMPUTE_WAIT")) == 0);
+        uint64_t t0 = SDL_GetTicksNS();
+        while (on && atomic_load(&cp->p.state) == 0 && SDL_GetTicksNS() - t0 < 250000000ull) {
+            jobs_bump(&jobs, cp);
+            SDL_DelayNS(250000);
+        }
+    }
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP(SKIP_COMPUTE_PROG); return; }
     if (cp->si->uses_bindless_image) {
         uint32_t limit = g_vk.props.limits.maxDescriptorSetStorageImages;
@@ -4172,7 +4574,20 @@ static bool compile_wait(CmdRec *r, bool indexed, _Atomic int *state, Prog *p, P
     // A build the startup warmup has queued is known to be coming (and moves to the front): waiting costs little,
     // skipping costs the draw.
     bool known = pp ? pp->warm : p && p->warm;
-    if ((!off && quad) || known) {
+    // TOTK's rule (docs/architecture.md: "skipped when one of its pass's targets was rendered in the previous frame,
+    // and waits otherwise, so one-shot passes are never lost"): a target nothing drew into last frame or this one is
+    // a pass that may not come again - a scene's first frame after a load, a render-to-texture done once. Its draw
+    // waits (same budget) instead of leaving the target unwritten. EOWRECOMP_VK_ONESHOT_WAIT=0: off.
+    static int oneshot_on = -1;
+    if (oneshot_on < 0) oneshot_on = !(getenv("EOWRECOMP_VK_ONESHOT_WAIT") && atoi(getenv("EOWRECOMP_VK_ONESHOT_WAIT")) == 0);
+    bool oneshot = false;
+    if (oneshot_on) {
+        extern uint64_t vk_frame_counter(void);
+        NvnTexture *t = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0] : st.rt.depth;
+        TexBackend *tb = t ? t->backend : NULL;
+        oneshot = tb && tb->drawn_frame < vk_frame_counter();  // (drawn_frame = frame + 1: last frame -> == counter)
+    }
+    if ((!off && quad) || known || oneshot) {
         extern uint64_t vk_frame_counter(void);
         static uint64_t budget_frame = ~0ull;
         static uint64_t spent_ns;
@@ -4189,7 +4604,8 @@ static bool compile_wait(CmdRec *r, bool indexed, _Atomic int *state, Prog *p, P
         spent_ns += waited;
         static int nlog;
         if (nlog++ < 32)
-            LOG_VERBOSE("[vk] %s draw waited %.1f ms for its %s (fs=%llx, %ux%u target)%s\n", known ? "warmup" : "full-screen", waited / 1e6, pp ? "pipeline" : "program",
+            LOG_VERBOSE("[vk] %s draw waited %.1f ms for its %s (fs=%llx, %ux%u target)%s\n",
+                known ? "warmup" : oneshot && !quad ? "one-shot target" : "full-screen", waited / 1e6, pp ? "pipeline" : "program",
                 (unsigned long long)(st.program ? st.program->stages[1].code_addr : 0), st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
                 st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, atomic_load(state) == 0 ? "; still building, skipped" : "");
         if (atomic_load(state) != 0) return atomic_load(state) == 1;
@@ -4360,13 +4776,17 @@ static void draw_(CmdRec *r, bool indexed) {
     Pipe *pp = pipe_tab[pslot].pipe;
     if (!pp) {
         pp = warm_pipe_find(ph);  // built (or being built) by the startup warmup from a recipe of an earlier run
-        if (pp) stat_warm_pipe_hits++;
-        else {
+        if (pp) {
+            stat_warm_pipe_hits++;
+            if (atomic_load(&pp->state) == 1) sess.reused_ready++;
+            else sess.reused_building++;
+        } else {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
             run_job(build_pipeline, pp);
             recipe_note(pr, &k);  // (for the next start's warmup)
             stat_new_pipes++;
+            sess.missed++;
         }
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
@@ -4375,8 +4795,16 @@ static void draw_(CmdRec *r, bool indexed) {
         SKIP(atomic_load(&pp->state) != 2 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED);  // (it may just have become ready)
         return;
     }
+    {   // (compile_wait: a target drawn in the previous frame is redrawn next frame; one that wasn't may not be)
+        extern uint64_t vk_frame_counter(void);
+        uint64_t f = vk_frame_counter() + 1;
+        for (int i = 0; i < st.rt.ncolor; i++)
+            if (st.rt.color[i] && st.rt.color[i]->backend) ((TexBackend *)st.rt.color[i]->backend)->drawn_frame = f;
+        if (st.rt.depth && st.rt.depth->backend) ((TexBackend *)st.rt.depth->backend)->drawn_frame = f;
+    }
     ss_enabled();
-    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
+    VkPipeline draw_pipe = atomic_load(&pp->optimized_state) == 1 ? pp->optimized : pp->pipe;
+    if (ss_need(SS_PIPE, ss.pipe == draw_pipe)) { ss.pipe = draw_pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipe); }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
 

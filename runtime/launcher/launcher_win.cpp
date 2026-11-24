@@ -14,6 +14,7 @@
 //            setup/build.ps1) are used as they are; Recompile is always offered; nothing is ever uploaded.
 //     --data: where game files, the built game, saves and caches live (default: this executable's folder).
 //     --recompile: start Recompile as soon as the chosen game files pass their check (scripted rebuilds).
+//     --prepare-shaders: start "Prepare shaders" (only Trirod-ShaderPrep) when the game is already built.
 //     --console (or EOWRECOMP_CONSOLE=1): a diagnostic console. The launcher is a GUI program and opens none by
 //            default; with this it prints its build log there (the console it was started from, or a new one) and
 //            starts Trirod.exe with --console, which prints the game's detailed diagnostics to the same console.
@@ -304,6 +305,8 @@ struct Paths {
     std::string config() const { return data + "\\trirod-launcher.ini"; }
     std::string install_json() const { return data + "\\trirod-install.json"; }
     std::string logs() const { return data + "\\logs"; }
+    // written by the game when the shader cache wasn't prepared for its GPU and driver (device.c pipeline_cache_check)
+    std::string shaders_stale() const { return data + "\\cache\\shaders-stale.txt"; }
     std::string shader_report() const { return data + "\\cache\\shaderprep.json"; }
 };
 static Paths g_paths;
@@ -914,6 +917,38 @@ static void write_install(const ToolsInfo &t, const std::string &shaders, const 
     write_file(g_paths.install_json(), s);
 }
 
+// Trirod-ShaderPrep (worker thread): never a failed build. What isn't prepared is built by the game when first drawn.
+static void prepare_shaders(std::string &shaders, std::string &note) {
+    shaders = "prepared";
+    note.clear();
+    ToolResult r = run_tool("Trirod-ShaderPrep", {g_paths.shaderprep(), "--data", g_paths.data}, g_paths.data);
+    std::lock_guard<std::mutex> l(g_mu);
+    Step *s = step("shaders");
+    if (r.exit == 0 && r.done) s->state = StepState::Done, s->progress = 1;
+    else if (g_cancel) s->state = StepState::Failed, s->note = "cancelled";
+    else {
+        shaders = r.exit == 3 ? "skipped" : "failed";
+        note = r.exit == 3 ? r.skip : r.error;
+        s->state = r.exit == 3 ? StepState::Skipped : StepState::Warned;
+        s->note = (r.exit == 3 ? "Left to the game: " : "Not prepared (the game builds them when first drawn): ") + note;
+    }
+}
+
+// "Prepare shaders": only the last step, for a game that is already built (another GPU or driver, or a cache from an
+// older build: the notice the game leaves in cache\shaders-stale.txt).
+static void shaders_workflow() {
+    open_build_log();
+    ToolsInfo tools = read_tools();
+    std::string shaders, note;
+    set_status("Preparing shaders for this graphics card");
+    prepare_shaders(shaders, note);
+    if (g_cancel) { set_status("Cancelled"); g_busy = false; return; }
+    if (build_state(tools).empty()) write_install(tools, shaders, note);
+    log_line(3, "shader preparation " + shaders);
+    set_status(shaders == "prepared" ? "Shaders prepared: ready to play" : "Shaders not prepared: the game builds them as it goes");
+    g_busy = false;
+}
+
 static void workflow(bool update_first, Release rel) {
     open_build_log();
     std::string why;
@@ -957,21 +992,8 @@ static void workflow(bool update_first, Release rel) {
         for (auto &s : g_steps)
             if (s.state == StepState::Running) s.state = StepState::Done, s.progress = 1;
     }
-    // The shaders: never a failed build. What isn't prepared is built by the game when first drawn.
-    std::string shaders = "prepared", note;
-    ToolResult r = run_tool("Trirod-ShaderPrep", {g_paths.shaderprep(), "--data", g_paths.data}, g_paths.data);
-    {
-        std::lock_guard<std::mutex> l(g_mu);
-        Step *s = step("shaders");
-        if (r.exit == 0 && r.done) s->state = StepState::Done, s->progress = 1;
-        else if (g_cancel) s->state = StepState::Failed, s->note = "cancelled";
-        else {
-            shaders = r.exit == 3 ? "skipped" : "failed";
-            note = r.exit == 3 ? r.skip : r.error;
-            s->state = r.exit == 3 ? StepState::Skipped : StepState::Warned;
-            s->note = (r.exit == 3 ? "Left to the game: " : "Not prepared (the game builds them when first drawn): ") + note;
-        }
-    }
+    std::string shaders, note;
+    prepare_shaders(shaders, note);
     if (g_cancel) { set_status("Cancelled"); g_busy = false; return; }
     std::string state = build_state(tools);
     if (!state.empty()) {
@@ -1027,6 +1049,19 @@ static void start_workflow(bool update_first) {
     reset_steps(update_first);
     Release rel = g_release;
     std::thread(workflow, update_first, rel).detach();
+}
+
+static void start_shaders_workflow() {
+    if (g_busy.exchange(true)) return;
+    g_cancel = false;
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        g_steps.clear();
+        g_steps.push_back({"shaders", "Preparing shaders for the graphics device"});
+        g_log.clear();
+        g_error.clear();
+    }
+    std::thread(shaders_workflow).detach();
 }
 
 static void cancel() {
@@ -1134,9 +1169,11 @@ int main(int argc, char **argv) {
     g_paths.install = exe_dir();
     g_paths.data = g_paths.install;
     bool auto_recompile = false;  // --recompile: start Recompile as soon as the game files are checked
+    bool auto_shaders = false;    // --prepare-shaders: start "Prepare shaders" once the built game is found
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dev")) g_dev = true;
         else if (!strcmp(argv[i], "--recompile")) auto_recompile = true;
+        else if (!strcmp(argv[i], "--prepare-shaders")) auto_shaders = true;
         else if (!strcmp(argv[i], "--console")) g_console = true;
         else if (!strcmp(argv[i], "--data") && i + 1 < argc) g_paths.data = full_path(argv[++i]);
     }
@@ -1246,9 +1283,12 @@ int main(int argc, char **argv) {
         }
         // (the files change only through the tools: read again once a second while idle)
         static std::string built = build_state(tools);
+        static std::string stale;  // (cache\shaders-stale.txt: why the game found no prepared shaders for its GPU)
         if (!busy && SDL_GetTicks() - tools_read_at > 1000) {
             tools = read_tools();
             built = build_state(tools);
+            stale = file_exists(g_paths.shaders_stale()) ? read_file(g_paths.shaders_stale()) : "";
+            while (!stale.empty() && (stale.back() == '\n' || stale.back() == '\r')) stale.pop_back();
             tools_read_at = SDL_GetTicks();
         }
         bool have_files = file_exists(g_paths.extracted() + "\\exefs\\main");
@@ -1303,6 +1343,7 @@ int main(int argc, char **argv) {
         bool need_update = !g_dev && rel.ok && rel.newer;
         bool can_build = tools.present && (source_ok || (have_files && src.empty()));
         if (auto_recompile && !busy && can_build) auto_recompile = false, start_workflow(false);
+        if (auto_shaders && !busy && ready) auto_shaders = false, start_shaders_workflow();
         if (busy) {
             if (ImGui::Button("Cancel", ImVec2(220, 0))) cancel();
             ImGui::SameLine();
@@ -1327,6 +1368,8 @@ int main(int argc, char **argv) {
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Recompile", ImVec2(160, 0))) start_workflow(false);
+                ImGui::SameLine();
+                if (ImGui::Button("Prepare shaders", ImVec2(160, 0))) start_shaders_workflow();
                 if (need_update) {
                     ImGui::SameLine();
                     if (ImGui::Button("Update", ImVec2(160, 0))) start_workflow(true);
@@ -1337,6 +1380,9 @@ int main(int argc, char **argv) {
                 if (primary_button("Recompile", can_build)) start_workflow(false);
             }
             ImGui::TextDisabled("%s", headline.c_str());
+            if (ready && !stale.empty())
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Shaders: %s. Prepare shaders to build them before playing "
+                                   "(the game otherwise builds them as it goes).", stale.c_str());
             if (ready) {
                 std::string sh = shader_summary();
                 if (!sh.empty()) ImGui::TextDisabled("%s", sh.c_str());

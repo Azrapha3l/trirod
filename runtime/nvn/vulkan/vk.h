@@ -39,6 +39,7 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, bindless_storage_images;
+    bool graphics_pipeline_library, gpl_fast_linking;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -89,6 +90,7 @@ typedef struct TexBackend {
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
     uint64_t touched_frame, frame_cleared;
+    uint64_t drawn_frame;  // vk_frame_counter() + 1 at the last draw into it (exec.c compile_wait: one-shot passes)
     uint32_t level_gen;
     float sx, sy;
     void *pending_rgba;  // host-produced pixels (video) waiting to be uploaded on the render thread

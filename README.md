@@ -5,7 +5,7 @@
 Trirod is a continuation of [EoWRecomp](https://github.com/Nycolazs/EoWRecomp) and its contributors' work. This repository carries that project forward and develops the Trirod launcher, Windows build and update workflow, and external shader preparation tools.
 
 > [!WARNING]
-> Trirod is in early development. The launcher can prepare and start the recompiled game, but compatibility, performance, and graphics issues are still being worked on. Check [docs/STATUS.md](docs/STATUS.md) for the current state.  If things seem slow or black, give it a second to catch up.  I'm working on a fix for asynchronous GPU Shaders. Or an alternative.
+> Trirod is in early development. The launcher can prepare and start the recompiled game, but compatibility, performance, and graphics issues are still being worked on. Check [docs/STATUS.md](docs/STATUS.md) for the current state.  Everything is playable so far. And I think I have the shader/pipeline fixed.
 
 > [!IMPORTANT]
 > Trirod does not include Nintendo game files, game assets, or console keys. You must provide your own legally obtained base game, version **1.0.0** (title ID `01008CF01BAAC000`, without a game update), and your own `prod.keys` file. Instructions for obtaining game files or keys are not provided.

@@ -12,6 +12,15 @@
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 #define FATAL(...) (fprintf(stderr, "FATAL: " __VA_ARGS__), rt_fatal_trace())
 
+// ---- log levels (log.c). Errors, warnings and one-time facts always go to the log. Detailed diagnostics - periodic
+// statistics, investigation notes, every call of a stubbed service command - only with rt_verbose():
+// EOWRECOMP_VERBOSE=1, or the diagnostic console (--console / EOWRECOMP_CONSOLE=1, which implies it).
+bool rt_verbose(void);
+// true the first time (site, key) is seen - a stubbed service command logs its first call - or always when verbose
+bool rt_log_first(const char *site, uint32_t key);
+#define LOG_VERBOSE(...) (rt_verbose() ? (void)LOG(__VA_ARGS__) : (void)0)
+#define LOG_FIRST(site, key, ...) (rt_log_first((site), (key)) ? (void)LOG(__VA_ARGS__) : (void)0)
+
 // ---- address space layout (guest addresses == host addresses; GUEST_SHIFT lower on Android, cpu.h)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
 // guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).

@@ -122,6 +122,32 @@ copy of that install's recipes:
 These measurements are from the tool alone. **Not yet verified in game:** whether a prepared cache reduces
 first-seen stutter in a real session.
 
+## Diagnostic console and logs (alpha_2)
+
+`Trirod-Launcher.exe` and `Trirod.exe` are GUI-subsystem programs and open no console window. Normally:
+
+- the launcher writes each build's transcript to `<data>\logs\last-build.log` (and shows it under **Show details**);
+- the game writes `eowrecomp.log` next to `Trirod.exe`: errors, warnings, and one-time facts (devices, services,
+  modules). Periodic statistics, investigation notes on draws and textures, and repeated calls of stubbed service
+  commands are left out. A stubbed command is logged on its first call only.
+
+Diagnostic mode is opt-in, either way:
+
+- `--console` on the command line of either program, or
+- `EOWRECOMP_CONSOLE=1` in the environment.
+
+Then the program prints to the console it was started from (a terminal), or opens its own console. The launcher also
+prints its build log there and starts `Trirod.exe --console`, which attaches to the same console. In the game, this
+also turns on the detailed diagnostics (`rt_verbose`, `runtime/log.c`). `EOWRECOMP_VERBOSE=1` turns on the same
+detail without a console, into `eowrecomp.log`. Output that is already redirected to a file or pipe stays there.
+The headless tools (`trbuild.exe`, `Trirod-ShaderPrep.exe`) are console programs that the launcher runs with pipes;
+their output goes to the build log either way.
+
+`Trirod.exe` loads SDL3, FFmpeg, and shaderc DLLs from the install folder. With the default data folder (the
+install folder) they sit beside it. With `--data <other folder>`, start the game through the launcher's **Play**,
+which puts the install folder first on `PATH`. Double-clicking that `Trirod.exe` shows Windows' "DLL not found"
+error.
+
 ## Local development builds (no upload)
 
 1. Edit the source in the checkout.
@@ -142,8 +168,9 @@ Development builds have no `UPDATE_REPO` and never contact GitHub, even without 
 1. Make and review the source changes. Update `EOWRECOMP_VERSION` in `runtime/ui/launcher.mm`; it is the release tag
    the Makefile, the tools, and the manifest use. The build identifiers change by themselves when the generator,
    headers, or runtime sources change.
-2. Build with the update source and GUI subsystem:
-   `./setup/build.ps1 -UpdateRepo <owner>/<repo> -Release -OutputDir build\setup-release`.
+2. Build with the update source:
+   `./setup/build.ps1 -UpdateRepo <owner>/<repo> -OutputDir build\setup-release`. Since alpha_2, every build makes
+   the launcher and `Trirod.exe` GUI programs (no console window), so there is no separate release switch.
 3. `./setup/make_release.ps1 -PackageDir build\setup-release -UpdateRepo <owner>/<repo> [-Required]`. It copies only
    the installation's own files into a fresh stage and runs `setup/check_package.ps1`, which refuses game files,
    packages, keys, shader archives or catalog, built game code, and caches. It zips the stage with `tar.exe` and writes

@@ -37,7 +37,7 @@ static uint32_t new_event(void) {
     return r;
 }
 
-#define UNHANDLED(iface) LOG("[am] %s cmd %u (unhandled, ok)\n", iface, req->cmd)
+#define UNHANDLED(iface) LOG_FIRST(iface, req->cmd, "[am] %s cmd %u (unhandled, ok)\n", iface, req->cmd)
 
 static void common_state_getter(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
@@ -89,7 +89,7 @@ static void window_controller(Service *s, IpcReq *req, IpcResp *resp) {
 }
 
 static void generic_ok(Service *s, IpcReq *req, IpcResp *resp) {
-    LOG("[am] %s cmd %u (ok)\n", s->name, req->cmd);
+    LOG_FIRST(s->name, req->cmd, "[am] %s cmd %u (ok)\n", s->name, req->cmd);
     resp_size(resp, 0x10);
 }
 
@@ -116,13 +116,13 @@ static void storage_accessor(Service *s, IpcReq *req, IpcResp *resp) {
         memcpy((void *)(uintptr_t)b->addr, st->data + off, n);
         break;
     }
-    default: LOG("[am] IStorageAccessor cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[am] IStorageAccessor", req->cmd, "[am] IStorageAccessor cmd %u (ok)\n", req->cmd);
     }
 }
 
 static void am_storage(Service *s, IpcReq *req, IpcResp *resp) {
     if (req->cmd == 0) ipc_return_object(resp, service_new("IStorageAccessor", storage_accessor, s->state));
-    else LOG("[am] IStorage cmd %u (ok)\n", req->cmd);
+    else LOG_FIRST("[am] IStorage", req->cmd, "[am] IStorage cmd %u (ok)\n", req->cmd);
 }
 
 static Service *new_am_storage(const void *data, uint64_t size) {

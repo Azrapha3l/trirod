@@ -614,7 +614,7 @@ static void movie_stats(void) {
     static uint64_t last;
     uint64_t now = n_acq_in + n_send + n_acq_out + n_rel_out;
     if (now / 200 != last / 200)
-        LOG("[movie] acq_in %llu send %llu frames %llu acq_out %llu get_out %llu rel_out %llu\n", n_acq_in, n_send,
+        LOG_VERBOSE("[movie] acq_in %llu send %llu frames %llu acq_out %llu get_out %llu rel_out %llu\n", n_acq_in, n_send,
             n_frames, n_acq_out, n_get_out, n_rel_out);
     last = now;
 }

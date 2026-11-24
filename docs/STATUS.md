@@ -2,6 +2,50 @@
 
 ## TODO
 
+**alpha_2 (2026-11-24, in preparation; alpha_1 is published at github.com/Azrapha3l/trirod).** Console and log
+cleanup. Nothing committed, published, or tagged.
+- Version: `EOWRECOMP_VERSION` in `runtime/ui/launcher.mm` → `alpha_2` (the Makefile, tools manifest, and release
+  manifest read it from there).
+- No console by default:
+  - `Trirod-Launcher.exe` and `Trirod.exe` are always GUI programs (Makefile `LAUNCHER_LDFLAGS`, `link.args`).
+  - `RELEASE=1` and `build.ps1 -Release` are gone.
+  - SDL's own log output is redirected: its default on Windows attached to the parent's console and printed into the
+    terminal even without `--console` (found by the test below).
+- Opt-in console:
+  - `--console` or `EOWRECOMP_CONSOLE=1` makes the program attach to the parent's console or open its own
+    (`runtime/platform/windows.c`, `launcher_win.cpp`). A redirected stderr stays redirected.
+  - The launcher prints its build log there and starts the game with `--console`.
+- Log levels (`runtime/log.c`, `rt.h` `LOG_VERBOSE` / `LOG_FIRST`):
+  - Verbose only (`rt_verbose`: console, or `EOWRECOMP_VERBOSE=1` for the file):
+    - periodic statistics: `[vk] t=… fps`, `[movie] acq_in`, `[vk] copy alias` counts, `command counts`;
+    - investigation notes: gpu-stored memory read as a cbuf, texture slot samples the dummy, alpha test ignored,
+      draw skipped/waited, fragment output with no colour attachment (its ring of 32 could repeat without limit), and
+      `copy alias: draw samples`;
+    - `[input] GetNpadState` and the `[audren] mix` matrix.
+  - Stubbed service commands (`[ipc] STUB`, `[am]`, `[fs]`, `[time]`, `[audren]`/`[audout] … cmd N (ok)`) log their
+    first call per (service, command).
+  - Errors, warnings, the capped hazard warning, and one-time facts are unchanged.
+  - Only log calls changed: `renderer_stats()` (which also saves recipes every 30 s) still runs every interval.
+- Build: `setup/build.ps1` OK. The launcher's PE subsystem is GUI, `trbuild`/`Trirod-ShaderPrep` are console
+  programs, and `link.args` has `--subsystem,windows`.
+- Verified (scratch data folder, started from a console session, probed with `AttachConsole` from another process):
+  - Launcher: normal has no console. `--console` and `EOWRECOMP_CONSOLE=1` show a console with the log.
+  - Game (60 s, hidden window, to the title screen): normal has no console. `eowrecomp.log` got 207 lines, all one-time
+    facts, with 0 fps-stats, mix, or command-count lines, and stubs once each. `--console` and `EOWRECOMP_CONSOLE=1`
+    show a console with the detailed diagnostics, including fps stats.
+- **Not verified:**
+  - The click on **Play** forwarding `--console`: SDL ignores posted mouse messages, so it was not automated. The
+    code is in `play()`.
+  - The case with no parent console (launched from Explorer + `--console` → `AllocConsole`).
+  - Gameplay beyond the title screen.
+- What the user should test:
+  1. Run `.\setup\build.ps1`.
+  2. Double-click `build\setup-dev\Trirod-Launcher.exe`: no console should appear.
+  3. **Play**: no console.
+  4. Run `Trirod-Launcher.exe --console` (from Explorer, e.g. a shortcut): a console should open. **Play** should
+     print the game's log in the same console.
+  5. Play a while in normal mode and check that `eowrecomp.log` stays small.
+
 **Windows launcher and build workflow (2026-11-23, implemented).** Details are in `docs/RELEASE-WORKFLOW.md`; the
 tool protocol is in `docs/TOOL-PROTOCOL.md`.
 - Implemented:

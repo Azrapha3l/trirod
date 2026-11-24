@@ -17,7 +17,7 @@ __attribute__((section(".svc$z"), used)) static const ServiceDef __stop_services
 #endif
 
 static void stub_handler(Service *s, IpcReq *req, IpcResp *resp) {
-    LOG("[ipc] STUB %s cmd %u (in %u bytes, x%d a%d b%d c%d) -> ok\n", s->name, req->cmd, req->data_size, req->nx,
+    LOG_FIRST(s->name, req->cmd, "[ipc] STUB %s cmd %u (in %u bytes, x%d a%d b%d c%d) -> ok\n", s->name, req->cmd, req->data_size, req->nx,
         req->na, req->nb, req->nc);
     resp->result = 0;
     resp_size(resp, 0x40);  // zeroed outputs

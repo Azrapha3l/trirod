@@ -391,7 +391,7 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         break;
     }
     case 4: OUT(uint64_t, 0) = ov_n ? ov_end : st->size; resp_size(resp, 8); break;  // GetSize
-    default: LOG("[fs] IStorage cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[fs] IStorage", req->cmd, "[fs] IStorage cmd %u (ok)\n", req->cmd);
     }
 }
 
@@ -466,7 +466,7 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         resp_size(resp, 8);
         break;
     }
-    default: LOG("[fs] IFile cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[fs] IFile", req->cmd, "[fs] IFile cmd %u (ok)\n", req->cmd);
     }
 }
 
@@ -585,7 +585,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     case 11: case 12: OUT(int64_t, 0) = 0x40000000; resp_size(resp, 8); break;
     case 13: rm_rf(p, true); break;
     case 14: memset(resp->data, 0, 0x20); resp_size(resp, 0x20); break;
-    default: LOG("[fs] IFileSystem cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[fs] IFileSystem", req->cmd, "[fs] IFileSystem cmd %u (ok)\n", req->cmd);
     }
 }
 
@@ -629,6 +629,6 @@ SERVICE("fsp-srv", fsp_srv) {
     case 1005: OUT(uint32_t, 0) = 0; resp_size(resp, 4); break;  // GetGlobalAccessLogMode
     case 1003: case 1004: case 1006: break;
     case 1011: memset(resp->data, 0, 0x10); resp_size(resp, 0x10); break;
-    default: LOG("[fs] fsp-srv cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[fs] fsp-srv", req->cmd, "[fs] fsp-srv cmd %u (ok)\n", req->cmd);
     }
 }

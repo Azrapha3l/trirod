@@ -800,10 +800,10 @@ static void update_mix(Renderer *r, const uint8_t *p, int id) {
     memcpy(&m->dest_splitter, p + 0x928, 4);
     memcpy(m->vol, p + 0x24, sizeof m->vol);
     if (!m->buf) m->buf = calloc(MIXBUF_MAX * r->sample_count, sizeof(float));
-    LOG("[audren] mix %d used %u vol %.3f bufs %u dest %d:", id, m->used, m->volume, m->bufs, m->dest);
-    for (int i = 0; i < MIXBUF_MAX * MIXBUF_MAX; i++)
-        if (m->vol[i] != 0) LOG(" %d>%d=%.3f", i / MIXBUF_MAX, i % MIXBUF_MAX, m->vol[i]);
-    LOG("\n");
+    LOG_VERBOSE("[audren] mix %d used %u vol %.3f bufs %u dest %d:", id, m->used, m->volume, m->bufs, m->dest);
+    for (int i = 0; i < MIXBUF_MAX * MIXBUF_MAX && rt_verbose(); i++)
+        if (m->vol[i] != 0) LOG_VERBOSE(" %d>%d=%.3f", i / MIXBUF_MAX, i % MIXBUF_MAX, m->vol[i]);
+    LOG_VERBOSE("\n");
 }
 
 // RequestUpdate: input is an UpdateDataHeader + sections; write a matching output.
@@ -959,7 +959,7 @@ static void audio_renderer(Service *s, IpcReq *req, IpcResp *resp) {
     case 7: resp->copy_handles[resp->ncopy++] = r->event_r; break;
     case 8: break;
     case 9: OUT(uint32_t, 0) = 100; resp_size(resp, 4); break;
-    default: LOG("[audren] IAudioRenderer cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[audren] IAudioRenderer", req->cmd, "[audren] IAudioRenderer cmd %u (ok)\n", req->cmd);
     }
 }
 
@@ -1204,7 +1204,7 @@ static void audio_out(Service *s, IpcReq *req, IpcResp *resp) {
     case 11: OUT(uint8_t, 0) = 1; resp_size(resp, 1); break;
     case 12: break;
     case 13: OUT(float, 0) = 1.0f; resp_size(resp, 4); break;
-    default: LOG("[audout] IAudioOut cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[audout] IAudioOut", req->cmd, "[audout] IAudioOut cmd %u (ok)\n", req->cmd);
     }
 }
 

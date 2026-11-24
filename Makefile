@@ -122,8 +122,9 @@ OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S 
 GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h); override for older CPUs
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared \
-            $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> eowrecomp.log)
+            -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared
+# (console subsystem: Trirod-ShaderPrep, run with pipes. Trirod.exe - linked by trbuild with link.args below - and the
+# launcher - LAUNCHER_LDFLAGS - are GUI programs: no console window; --console / EOWRECOMP_CONSOLE=1 opens one)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 BACKEND_OBJ += $(if $(wildcard docs/icon/icon.ico),$(B)/rt/platform/windows_rc.o)  # the .exe's icon (none yet)
@@ -176,7 +177,7 @@ LAUNCHER_OBJ := $(B)/launcher/launcher_win.o $(B)/imgui/imgui.o $(B)/imgui/imgui
 # (no -lvulkan-1 / shaderc / FFmpeg: the link below fails if the executable imports any of them)
 OBJDUMP ?= objdump
 LAUNCHER_LDFLAGS := -fuse-ld=lld $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lwinhttp -lbcrypt -lshell32 -lole32 -luuid \
-                    $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)
+                    -Wl$(comma)--subsystem$(comma)windows
 TRBUILD_OBJ := $(B)/tools/trbuild.o $(B)/rt/gamebuild.o $(B)/rt/nxpkg.o $(B)/rt/romfs_build.o $(B)/rt/paths.o \
                $(B)/rt/platform/windows.o
 SHADERPREP_OBJ := $(B)/tools/shaderprep.o $(filter-out $(B)/rt/main_game.o,$(WIN_GAME_RUNTIME_OBJ))
@@ -301,7 +302,7 @@ $(RUNTIME_LIB): $(WIN_GAME_RUNTIME_OBJ)
 	$(or $(AR),ar) rcs $@ $^
 $(RUNTIME_ARGS): Makefile
 	@mkdir -p $(dir $@)
-	@printf '%s\n' '-Wl,--stack,16777216' '$(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)' '-lSDL3' '-lavformat' '-lavcodec' '-lavutil' '-lswscale' '-lvulkan-1' '-lwinmm' '-lole32' '-lshell32' '-lcomdlg32' '-luuid' '-lshaderc_shared' '$(if $(filter 1,$(WINCROSS)),,link-kit/lib/stdc++.lib)' > $@
+	@printf '%s\n' '-Wl,--stack,16777216' '-Wl,--subsystem,windows' '-lSDL3' '-lavformat' '-lavcodec' '-lavutil' '-lswscale' '-lvulkan-1' '-lwinmm' '-lole32' '-lshell32' '-lcomdlg32' '-luuid' '-lshaderc_shared' '$(if $(filter 1,$(WINCROSS)),,link-kit/lib/stdc++.lib)' > $@
 # The runtime's C++ objects (MSYS2 clang++) use libstdc++: link.args names its import library (libstdc++-6.dll ships
 # with the runtime DLLs), which zig's own toolchain does not have. Installs used to need a hand-copied one.
 RUNTIME_STDCXX := $(RUNTIME_KIT)/lib/stdc++.lib

@@ -8,6 +8,7 @@
 #include <shellapi.h>
 #include <timeapi.h>
 #include <io.h>
+#include <SDL3/SDL_log.h>
 
 #include "../platform.h"
 
@@ -139,6 +140,39 @@ static void log_to_file_without_console(void) {
     _putenv("EOWRECOMP_LOG_APPEND=1");
 }
 
+// The diagnostic console (--console on the command line, or EOWRECOMP_CONSOLE=1). Trirod.exe is a GUI-subsystem
+// program: by default no console window opens and the log goes to eowrecomp.log (above). With the option it prints
+// to the console it was started from - a terminal, or Trirod-Launcher.exe --console - or opens one of its own, and
+// rt_verbose (log.c) turns the detailed diagnostics on. --console becomes EOWRECOMP_CONSOLE=1 in the environment, so
+// a re-exec (main.c reserve_guest_space) and rt_verbose see it too.
+static bool console_requested(void) {
+    const char *e = getenv("EOWRECOMP_CONSOLE");
+    if (e && *e && strcmp(e, "0") != 0) return true;
+    int n = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &n);
+    bool asked = false;
+    for (int i = 1; argv && i < n; i++) asked |= wcscmp(argv[i], L"--console") == 0;
+    if (argv) LocalFree(argv);
+    if (asked) _putenv("EOWRECOMP_CONSOLE=1");
+    return asked;
+}
+
+static bool open_console(void) {
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) return true;  // (already redirected to a file or pipe: keep that)
+    if (!AttachConsole(ATTACH_PARENT_PROCESS) && !AllocConsole()) return false;
+    if (!freopen("CONOUT$", "wb", stdout) || !freopen("CONOUT$", "wb", stderr)) return false;
+    setvbuf(stderr, NULL, _IONBF, 0);
+    return true;
+}
+
+// SDL's own log lines (SDL_Log*) into ours: SDL's default output on Windows attaches to the parent's console to print
+// them, which would put text in the terminal a GUI program was started from even without --console.
+static void SDLCALL sdl_log(void *user, int category, SDL_LogPriority priority, const char *message) {
+    (void)user, (void)category, (void)priority;
+    fprintf(stderr, "[sdl] %s\n", message);
+}
+
 // The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
 // with an illegal instruction on an older CPU.
 static void require_cpu(void) {
@@ -182,7 +216,8 @@ void plat_fatal_notice(void) {
 }
 
 void plat_init(void) {
-    log_to_file_without_console();
+    if (!console_requested() || !open_console()) log_to_file_without_console();
+    SDL_SetLogOutputFunction(sdl_log, NULL);
     require_cpu();
     _fmode = _O_BINARY;  // fopen/open default to binary (the runtime's "r"/"w" files are binary or LF text)
     _setmode(_fileno(stdout), _O_BINARY);

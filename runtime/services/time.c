@@ -40,7 +40,7 @@ static void system_clock(Service *s, IpcReq *req, IpcResp *resp) {
     switch (req->cmd) {
     case 0: OUT(int64_t, 0) = unix_now(); resp_size(resp, 8); break;  // GetCurrentTime
     case 2: write_system_context(resp->data); resp_size(resp, 0x20); break;  // GetSystemClockContext
-    default: LOG("[time] ISystemClock cmd %u (ok)\n", req->cmd);
+    default: LOG_FIRST("[time] ISystemClock", req->cmd, "[time] ISystemClock cmd %u (ok)\n", req->cmd);
     }
 }
 
@@ -52,7 +52,7 @@ static void steady_clock(Service *s, IpcReq *req, IpcResp *resp) {
         memcpy(resp->data + 8, clock_uuid, 16);
         resp_size(resp, 0x18);
         break;
-    default: OUT(int64_t, 0) = 0; resp_size(resp, 8); LOG("[time] ISteadyClock cmd %u (ok)\n", req->cmd);
+    default: OUT(int64_t, 0) = 0; resp_size(resp, 8); LOG_FIRST("[time] ISteadyClock", req->cmd, "[time] ISteadyClock cmd %u (ok)\n", req->cmd);
     }
 }
 
@@ -98,7 +98,7 @@ static void timezone_service(Service *s, IpcReq *req, IpcResp *resp) {
         resp_size(resp, 4);
         break;
     }
-    default: LOG("[time] ITimeZoneService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);
+    default: LOG_FIRST("[time] ITimeZoneService", req->cmd, "[time] ITimeZoneService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);
     }
 }
 
@@ -119,7 +119,7 @@ static void static_service(Service *s, IpcReq *req, IpcResp *resp) {
         break;
     }
     case 100: case 101: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;
-    default: LOG("[time] IStaticService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);
+    default: LOG_FIRST("[time] IStaticService", req->cmd, "[time] IStaticService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);
     }
 }
 

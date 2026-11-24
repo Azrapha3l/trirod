@@ -779,9 +779,9 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
 const char *renderer_stats(void) {
     static int dumps;
     if (dumps++ < 3) {
-        LOG("[vk] command counts:");
-        for (int i = 0; i < CMD_COUNT; i++) if (op_counts[i]) LOG(" %d:%llu", i, (unsigned long long)op_counts[i]);
-        LOG("\n");
+        LOG_VERBOSE("[vk] command counts:");
+        for (int i = 0; i < CMD_COUNT; i++) if (op_counts[i]) LOG_VERBOSE(" %d:%llu", i, (unsigned long long)op_counts[i]);
+        LOG_VERBOSE("\n");
     }
     snprintf(stats_text, sizeof stats_text,
              "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu, upload %.1fMB",
@@ -2622,7 +2622,7 @@ void vk_alias_reset(void) { naliases = 0; }  // (reboot: every texture goes)
 void vk_alias_stats(void) {
     static int n;
     if (!stat_alias_made || (n++ > 5 && n % 30)) return;
-    LOG("[vk] copy alias: %llu made, %llu renamed, %llu stencil-only, %llu copied later (live %d)\n",
+    LOG_VERBOSE("[vk] copy alias: %llu made, %llu renamed, %llu stencil-only, %llu copied later (live %d)\n",
         (unsigned long long)stat_alias_made, (unsigned long long)stat_alias_renamed, (unsigned long long)stat_alias_partial,
         (unsigned long long)stat_alias_copied, naliases);
     stat_alias_made = stat_alias_renamed = stat_alias_partial = stat_alias_copied = 0;
@@ -2657,7 +2657,7 @@ static void alias_draw_check(Prog *pr) {
         if (a->src != d || !alias_valid(a) || !draw_samples_texture(pr, a->dst)) continue;
         static int nlog;
         if (nlog++ < 8)
-            LOG("[vk] copy alias: draw samples %p while its source %p is the depth attachment; copying\n", (void *)a->dst, (void *)d);
+            LOG_VERBOSE("[vk] copy alias: draw samples %p while its source %p is the depth attachment; copying\n", (void *)a->dst, (void *)d);
         alias_copy(a, ((TexBackend *)a->dst->backend)->aspect, "dst sampled, src attached");
         alias_drop(i);
     }
@@ -3244,7 +3244,7 @@ static void gstore_sync_cbufs(int stage, const ShaderInfo *si) {
         if (!hit) continue;
         static int nlog;
         if (nlog++ < 16)
-            LOG("[vk] gpu-stored memory read as a constant buffer: stage %d c%d %llx+%llx (%s %llx); waiting for the GPU\n",
+            LOG_VERBOSE("[vk] gpu-stored memory read as a constant buffer: stage %d c%d %llx+%llx (%s %llx); waiting for the GPU\n",
                 stage, k, (unsigned long long)r.addr, (unsigned long long)size, stage == 5 ? "cs" : stage ? "fs" : "vs",
                 (unsigned long long)(st.program ? st.program->stages[stage].code_addr : 0));
         stat_gstore_waits++;
@@ -3461,7 +3461,7 @@ static void dummy_slot_note(int stage, int i, const ShaderTexture *st_, uint64_t
     NvnTexture *sampled = tex && naliases ? alias_read(tex) : tex;
     TexBackend *b = sampled ? sampled->backend : NULL;
     bool attached = tex && (tex == st.rt.depth || (st.rt.ncolor > 0 && tex == st.rt.color[0]));
-    LOG("[vk] texture slot samples the dummy: stage %d shader %llx t%d (handle c[%#x] tic %u tsc %u) wants %s%s; tex %p "
+    LOG_VERBOSE("[vk] texture slot samples the dummy: stage %d shader %llx t%d (handle c[%#x] tic %u tsc %u) wants %s%s; tex %p "
         "nvn fmt %#x %ux%ux%u target %u layers %u samples %u%s | pass: %d colour, depth %p\n", stage, (unsigned long long)code, i,
         st_->handle_offset, (unsigned)(h & 0xFFFFF), (unsigned)(h >> 20) & 0xFFF, textype_name(st_->type), st_->shadow ? " (shadow)" : "",
         (void *)tex, tex ? tex->format : 0, tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->depth : 0, tex ? tex->target : 0,
@@ -4149,7 +4149,7 @@ static void draw_diag(Prog *pr, CmdRec *r, bool indexed) {
         for (int k = 0; k < nseen; k++) known |= seen[k].fs == fs && seen[k].func == func;
         if (!known && nseen < 16) {
             seen[nseen].fs = fs; seen[nseen++].func = func;
-            LOG("[vk] alpha test func %u ref %.3f ignored (not implemented in the Vulkan backend): fs=%llx frame %llu draw %u\n",
+            LOG_VERBOSE("[vk] alpha test func %u ref %.3f ignored (not implemented in the Vulkan backend): fs=%llx frame %llu draw %u\n",
                 func, st.alpha_ref, (unsigned long long)fs, (unsigned long long)frame, diag_draw);
         }
     }
@@ -4189,7 +4189,7 @@ static bool compile_wait(CmdRec *r, bool indexed, _Atomic int *state, Prog *p, P
         spent_ns += waited;
         static int nlog;
         if (nlog++ < 32)
-            LOG("[vk] %s draw waited %.1f ms for its %s (fs=%llx, %ux%u target)%s\n", known ? "warmup" : "full-screen", waited / 1e6, pp ? "pipeline" : "program",
+            LOG_VERBOSE("[vk] %s draw waited %.1f ms for its %s (fs=%llx, %ux%u target)%s\n", known ? "warmup" : "full-screen", waited / 1e6, pp ? "pipeline" : "program",
                 (unsigned long long)(st.program ? st.program->stages[1].code_addr : 0), st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
                 st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, atomic_load(state) == 0 ? "; still building, skipped" : "");
         if (atomic_load(state) != 0) return atomic_load(state) == 1;
@@ -4197,7 +4197,7 @@ static bool compile_wait(CmdRec *r, bool indexed, _Atomic int *state, Prog *p, P
         static int nlog;
         if (nlog++ < 32) {
             NvnTexture *c0 = st.rt.ncolor ? st.rt.color[0] : NULL;
-            LOG("[vk] draw skipped, %s building: fs=%llx count %llu inst %llu -> c0 %p %ux%u addr %llx, depth %p\n", pp ? "pipeline" : "program",
+            LOG_VERBOSE("[vk] draw skipped, %s building: fs=%llx count %llu inst %llu -> c0 %p %ux%u addr %llx, depth %p\n", pp ? "pipeline" : "program",
                 (unsigned long long)(st.program ? st.program->stages[1].code_addr : 0), (unsigned long long)count, (unsigned long long)inst,
                 (void *)c0, c0 ? c0->width : 0, c0 ? c0->height : 0, c0 ? (unsigned long long)c0->addr : 0ull, (void *)st.rt.depth);
         }
@@ -4260,7 +4260,7 @@ static void draw_(CmdRec *r, bool indexed) {
         for (unsigned i = 0; i < 32; i++) seen |= warned_fs[i] == fs;
         if (!seen) {
             warned_fs[warned_next++ & 31] = fs;
-            LOG("[vk] fragment color output has no color attachment: fs=%llx out_mask=%#x depth=%p depth_fmt=%#x draw=%s count=%llu instances=%llu\n",
+            LOG_VERBOSE("[vk] fragment color output has no color attachment: fs=%llx out_mask=%#x depth=%p depth_fmt=%#x draw=%s count=%llu instances=%llu\n",
                 (unsigned long long)fs, pr->fi->out_mask, (void *)st.rt.depth, st.rt.depth ? st.rt.depth->format : 0,
                 indexed ? "indexed" : "arrays", (unsigned long long)r->x[2],
                 (unsigned long long)r->x[indexed ? 6 : 4]);

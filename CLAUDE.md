@@ -44,6 +44,10 @@ implementado mas nunca foi testado contra uma release publicada; não o descreva
   instrução Maxwell faltando: implementar corretamente e adicionar teste em `tools/` (`test_translate`,
   `test_shaders`, `test_simd`, `test_lift`).
 - Variáveis de ambiente de depuração usam o prefixo `EOWRECOMP_`.
+- Logs: `LOG` só para erros, avisos e fatos de uma vez. Diagnóstico repetido (estatísticas periódicas, notas por
+  draw/textura) usa `LOG_VERBOSE`; comando de serviço sem implementação usa `LOG_FIRST` (`runtime/log.c`). Não
+  colocar chamadas com efeito colateral nos argumentos de `LOG_VERBOSE` (não são avaliados fora do modo verbose).
+  O launcher e o `Trirod.exe` não abrem console; `--console` / `EOWRECOMP_CONSOLE=1` abre (`docs/RELEASE-WORKFLOW.md`).
 
 ## Verificação
 - Uma correção só está verificada depois de vista funcionando (screenshot, log ou teste) — nunca declarar

@@ -14,6 +14,9 @@
 //            setup/build.ps1) are used as they are; Recompile is always offered; nothing is ever uploaded.
 //     --data: where game files, the built game, saves and caches live (default: this executable's folder).
 //     --recompile: start Recompile as soon as the chosen game files pass their check (scripted rebuilds).
+//     --console (or EOWRECOMP_CONSOLE=1): a diagnostic console. The launcher is a GUI program and opens none by
+//            default; with this it prints its build log there (the console it was started from, or a new one) and
+//            starts Trirod.exe with --console, which prints the game's detailed diagnostics to the same console.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -305,6 +308,7 @@ struct Paths {
 };
 static Paths g_paths;
 static bool g_dev;
+static bool g_console;  // --console / EOWRECOMP_CONSOLE=1
 
 // tools/trirod-tools.json (setup/pack_tools.ps1): which release the tools are and the build identifiers they produce
 struct ToolsInfo {
@@ -391,6 +395,7 @@ static void log_line(int kind, const std::string &t) {
         fprintf(g_log_file, "%s%s\n", tag[kind], t.c_str());
         fflush(g_log_file);
     }
+    if (g_console) fprintf(stderr, "%s\n", t.c_str());
 }
 static void set_status(const std::string &s) { std::lock_guard<std::mutex> l(g_mu); g_status = s; }
 static Step *step(const std::string &id) {
@@ -1032,7 +1037,7 @@ static void cancel() {
 
 static bool play(std::string &why) {
     std::wstring exe = widen(g_paths.game_exe());
-    std::wstring cmd = L"\"" + exe + L"\"";
+    std::wstring cmd = L"\"" + exe + L"\"" + (g_console ? L" --console" : L"");
     std::wstring env = child_env();
     STARTUPINFOW si = {};
     si.cb = sizeof si;
@@ -1132,10 +1137,27 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dev")) g_dev = true;
         else if (!strcmp(argv[i], "--recompile")) auto_recompile = true;
+        else if (!strcmp(argv[i], "--console")) g_console = true;
         else if (!strcmp(argv[i], "--data") && i + 1 < argc) g_paths.data = full_path(argv[++i]);
+    }
+    {   // (as runtime/platform/windows.c: the console it was started from, or a new one; a redirected stderr stays)
+        const char *e = getenv("EOWRECOMP_CONSOLE");
+        if (e && *e && strcmp(e, "0")) g_console = true;
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        if (g_console && (!h || h == INVALID_HANDLE_VALUE) && (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole())) {
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+            setvbuf(stderr, NULL, _IONBF, 0);
+        }
+        if (g_console) fprintf(stderr, "Trirod-Launcher %s: diagnostic console on\n", TRIROD_VERSION);
     }
     CreateDirectoryW(widen(g_paths.data).c_str(), NULL);
     config_load();
+    // SDL's log lines only on the diagnostic console: its default output on Windows attaches to the parent's console,
+    // which would print into the terminal the launcher was started from
+    SDL_SetLogOutputFunction([](void *, int, SDL_LogPriority, const char *message) {
+        if (g_console) fprintf(stderr, "[sdl] %s\n", message);
+    }, NULL);
 
     // SDL's 2D renderer, never its Vulkan one: the launcher leaves the GPU's Vulkan device to the game and the tools
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11,direct3d12,direct3d,opengl,software");

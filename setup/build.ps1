@@ -6,8 +6,6 @@ param(
     # owner/name of the GitHub repository whose Releases the launcher checks (release builds only; empty: the
     # launcher never goes online). docs/RELEASE-WORKFLOW.md
     [string]$UpdateRepo = '',
-    # GUI-subsystem executables (no console windows), as published releases are built
-    [switch]$Release,
     [switch]$SkipCompile
 )
 
@@ -58,7 +56,6 @@ try {
         $makeBuildDir = $BuildDir.Replace('\', '/')
         $makeArgs = @("-j$Jobs", "B=$makeBuildDir", 'DEPS=build/win/diag-prefix', 'WIN_DEPS=build/win/deps',
                       'ZIG=build/zig/zig.exe', "UPDATE_REPO=$UpdateRepo")
-        if ($Release) { $makeArgs += 'RELEASE=1' }
         & $make @makeArgs 'all'
         if ($LASTEXITCODE -ne 0) { throw "TriRod build failed with exit code $LASTEXITCODE." }
     }

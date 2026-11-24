@@ -851,9 +851,13 @@ void backend_present(NvnTexture *t) {
     prev_present = now;
     if (now - last_fps_time >= fps_iv) {
         extern const char *game_level_name(void);
-        if (last_fps_time > 0)
-            LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms level %s (%s)\n", now, (unsigned long long)total_frames,
-                frames / (now - last_fps_time), max_gap * 1000.0, game_level_name(), renderer_stats());
+        if (last_fps_time > 0) {
+            // (always run: renderer_stats also closes the interval's counters and saves new pipeline recipes; only
+            // the line itself is a verbose diagnostic)
+            const char *stats = renderer_stats();
+            LOG_VERBOSE("[vk] t=%.1f frame %llu %.1f fps max %.0fms level %s (%s)\n", now, (unsigned long long)total_frames,
+                frames / (now - last_fps_time), max_gap * 1000.0, game_level_name(), stats);
+        }
         max_gap = 0;
         frames = 0;
         last_fps_time = now;

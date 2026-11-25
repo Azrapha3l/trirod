@@ -11,7 +11,7 @@ shader catalog, so those cache directories are not copied into the repository or
 After playing a development build, merge its learned recipes into this catalog from the repository root:
 
 ```powershell
-python tools\export_shader_warm.py "[local path omitted]"
+python tools\export_shader_warm.py "D:\path\to\Trirod-data\cache"
 ```
 
 The exporter reads only `cache\warm\recipes.bin` and the code files those recipes reference. It validates the record

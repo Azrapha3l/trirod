@@ -5,10 +5,10 @@
 Trirod is a continuation of [EoWRecomp](https://github.com/Nycolazs/EoWRecomp) and its contributors' work. This repository carries that project forward and develops the Trirod launcher, Windows build and update workflow, and external shader preparation tools.
 
 > [!WARNING]
-> Trirod is in early development. The launcher can prepare and start the recompiled game, but compatibility, performance, and graphics issues are still being worked on. Check [docs/STATUS.md](docs/STATUS.md) for the current state.  Everything is playable so far. And I think I have the shader/pipeline fixed.
+> Trirod is in early development. The game is playable, but compatibility, performance, and graphics issues are still being worked on. Dynamic resolution can cause visual artifacts, which may be related to shader compilation; this is still under investigation. These artifacts have not appeared with internal resolution set to 1x (native) or higher. A fix is planned for a future release. See [docs/STATUS.md](docs/STATUS.md) for current details.
 
 > [!IMPORTANT]
-> Trirod does not include Nintendo game files, game assets, or console keys. You must provide your own legally obtained base game, version **1.0.0** (title ID `01008CF01BAAC000`, without a game update), and your own `prod.keys` file. Instructions for obtaining game files or keys are not provided.
+> Trirod does not include Nintendo game files, game assets, or console keys. You must provide your own legally obtained base game, version **1.0.0** (title ID `01008CF01BAAC000`), and your own `prod.keys` file. The **1.1.0** game update has been tested and is working. Other game updates have not been tested. Instructions for obtaining game files or keys are not provided.
 
 ## Run Trirod on Windows
 
@@ -23,7 +23,7 @@ The Windows release is distributed as a tools package. The package contains the 
 ### First launch
 
 1. Download `Trirod-Tools-<version>.zip` from [Trirod Releases](https://github.com/Azrapha3l/trirod/releases/latest).
-2. Extract the **entire ZIP** to a writable folder, for example `[local path omitted]`. Keep the launcher, tools, and DLLs together in that folder.
+2. Extract the **entire ZIP** to a writable folder of your choice. Keep the launcher, tools, and DLLs together in that folder.
 3. Run `Trirod-Launcher.exe`.
 4. In the launcher, choose the folder containing your game files, or choose your `.xci` / `.nsp` package. If you select a package, place `prod.keys` beside it.
 5. Select **Recompile**. The launcher shows progress while it prepares the game files, translates and compiles the game code, links the runtime, and prepares shaders for your graphics device.

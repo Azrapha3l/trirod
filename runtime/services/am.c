@@ -161,6 +161,10 @@ static void application_functions(Service *s, IpcReq *req, IpcResp *resp) {
     case 23: memcpy(resp->data, "1.0.0", 6); resp_size(resp, 0x10); break;
     case 40: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // NotifyRunning
     case 130: case 140: resp->copy_handles[resp->ncopy++] = new_event(); break;
+    // 210 (yuzu GetUnknownEvent210, application_functions.cpp 540: a readable event, never signaled there). The v1.1.0
+    // update asks for it after creating its window; with no handle in the reply it polled WaitSynchronization on an
+    // invalid handle forever (0xE401, 2026-11-25), before its first present: the shader warm-up screen stayed up.
+    case 210: resp->copy_handles[resp->ncopy++] = new_event(); break;
     default: UNHANDLED("IApplicationFunctions");
     }
 }

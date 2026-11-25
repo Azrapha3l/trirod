@@ -4,12 +4,12 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-if (-not (Test-Path [local path omitted] {
+if (-not (Test-Path C:\msys64\usr\bin\pacman.exe)) {
     winget install --id MSYS2.MSYS2 -e --accept-source-agreements --accept-package-agreements --silent
 }
 $env:MSYSTEM = 'UCRT64'
 $env:CHERE_INVOKING = '1'
-$bash = '[local path omitted]
+$bash = 'C:\msys64\usr\bin\bash.exe'
 & $bash -lc 'pacman -Syuu --noconfirm' | Out-Null
 & $bash -lc 'pacman -Syuu --noconfirm' | Out-Null  # second pass after a core update
 $pkgs = 'make', 'mingw-w64-ucrt-x86_64-clang', 'mingw-w64-ucrt-x86_64-lld', 'mingw-w64-ucrt-x86_64-sdl3',
@@ -35,4 +35,4 @@ if (-not (Test-Path "$las\venv\Scripts\python.exe")) { & $py -m venv "$las\venv"
 # LF line endings in this clone (the bash tools break with CRLF; Git for Windows defaults to autocrlf=true)
 git -C $root config core.autocrlf false
 git -C $root config core.eol lf
-Write-Host 'Done. Build from an MSYS2 UCRT64 shell (or put [local path omitted] first on PATH): make -j'
+Write-Host 'Done. Build from an MSYS2 UCRT64 shell (or put C:\msys64\ucrt64\bin;C:\msys64\usr\bin first on PATH): make -j'

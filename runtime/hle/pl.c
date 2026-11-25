@@ -116,9 +116,9 @@ static void load_fonts(void) {
     if (!rt_resource("DejaVuSans.ttf", "third_party/fonts/DejaVu/DejaVuSans.ttf", shipped, sizeof shipped)) shipped[0] = 0;
     const char *std[] = {env, "fonts/nintendo_udsg-r_std_003.bfttf", "fonts/nintendo_udsg-r_std_003.ttf",
                          "fonts/nintendo_udsgr_std_003.ttf", "fonts/nintendo_udsgr_std_003.bfttf",
-                         "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "[local path omitted]",
-                         "[local path omitted]", "/System/Library/Fonts/Supplemental/Arial.ttf",
-                         "[local path omitted]",
+                         "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc", "C:/Windows/Fonts/YuGothR.ttc",
+                         "C:/Windows/Fonts/YuGothM.ttc", "/System/Library/Fonts/Supplemental/Arial.ttf",
+                         "C:/Windows/Fonts/arial.ttf",
                          // Linux: DejaVu Sans (Debian / Ubuntu, Arch, Fedora). Not Noto Sans CJK: CFF outlines,
                          // which the game's font engine crashes on (it wants TrueType)
                          "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",

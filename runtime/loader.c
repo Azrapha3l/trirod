@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "elf_dyn.h"
 #include "rt.h"
 
 Module g_modules[GAME_NMODULES];
@@ -79,11 +80,13 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
     uint32_t mod0 = *(uint32_t *)(base + 4);
     uint64_t mod = base + mod0;
     m->dynamic = mod + *(int32_t *)(mod + 4);
+    uint64_t gnu_hash = 0;
     for (uint64_t *d = (uint64_t *)m->dynamic; d[0] != DT_NULL; d += 2) {
         switch (d[0]) {
         case DT_SYMTAB: m->symtab = base + d[1]; break;
         case DT_STRTAB: m->strtab = base + d[1]; break;
         case DT_HASH: m->nsyms = *(uint32_t *)(base + d[1] + 4); break;
+        case ELF_DT_GNU_HASH: gnu_hash = base + d[1]; break;
         case 12: m->init = base + d[1]; break;  // DT_INIT
         case 13: m->fini = base + d[1]; break;  // DT_FINI
         case DT_INIT_ARRAY: m->init_array = base + d[1]; break;
@@ -92,6 +95,8 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
         case DT_FINI_ARRAYSZ: m->fini_array_sz = d[1]; break;
         }
     }
+    // (nnSdk 20 modules, the v1.1.0 update's, have only DT_GNU_HASH: runtime/elf_dyn.h)
+    if (!m->nsyms && gnu_hash) m->nsyms = elf_gnu_hash_nsyms((const uint8_t *)(uintptr_t)gnu_hash);
     LOG("loaded %-5s at %llx size %llx syms %llu\n", m->name, base, size, m->nsyms);
 }
 
@@ -147,12 +152,21 @@ static uint64_t resolve(Module *m, uint32_t symidx) {
 }
 
 static void relocate(Module *m) {
-    uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0;
+    uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0, relr = 0, relrsz = 0;
     for (uint64_t *d = (uint64_t *)m->dynamic; d[0] != DT_NULL; d += 2) {
+        if (d[0] == ELF_DT_RELR) relr = m->base + d[1];
+        if (d[0] == ELF_DT_RELRSZ) relrsz = d[1];
         if (d[0] == DT_RELA) rela = m->base + d[1];
         if (d[0] == DT_RELASZ) relasz = d[1];
         if (d[0] == DT_JMPREL) jmprel = m->base + d[1];
         if (d[0] == DT_PLTRELSZ) pltsz = d[1];
+    }
+    // Packed relative relocations first (the v1.1.0 update's modules keep all of them in DT_RELR: runtime/elf_dyn.h)
+    if (relr && relrsz) {
+        uint64_t bad, n = elf_relr_apply((uint8_t *)(uintptr_t)m->base, m->size, m->base,
+                                         (const uint64_t *)(uintptr_t)relr, relrsz / 8, &bad);
+        if (bad) FATAL("%s: %llu DT_RELR entries outside the module\n", m->name, (unsigned long long)bad);
+        LOG("%-5s: %llu packed relative relocations\n", m->name, (unsigned long long)n);
     }
     int unresolved = 0;
     for (int pass = 0; pass < 2; pass++) {

@@ -4,8 +4,37 @@ import sys
 import lz4.block
 
 DT_NULL, DT_NEEDED, DT_PLTRELSZ, DT_HASH, DT_STRTAB, DT_SYMTAB, DT_RELA, DT_RELASZ = 0, 1, 2, 4, 5, 6, 7, 8
-DT_STRSZ, DT_JMPREL, DT_RELACOUNT = 10, 23, 0x6FFFFFF9
+DT_STRSZ, DT_JMPREL, DT_RELACOUNT, DT_GNU_HASH = 10, 23, 0x6FFFFFF9, 0x6FFFFEF5
+DT_RELRSZ, DT_RELR = 0x23, 0x24
 R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE = 257, 1025, 1026, 1027
+
+
+def relr_offsets(entries):
+    """Offsets a DT_RELR table relocates (ELF gABI SHT_RELR, as lld writes it; runtime/elf_dyn.h does the same): an
+    even entry is one offset and starts a run there, an odd one a bitmap over the 63 words after the run's position."""
+    out, where = [], 0
+    for e in entries:
+        if not e & 1:
+            out.append(e)
+            where = e + 8
+            continue
+        out.extend(where + (b - 1) * 8 for b in range(1, 64) if e >> b & 1)
+        where += 63 * 8
+    return out
+
+
+def gnu_hash_nsyms(buf, off):
+    """Dynamic symbol count from the DT_GNU_HASH table at buf[off:]: one past the end of the chain that starts last
+    (every symbol from symoffset on is in exactly one chain, ended by an entry with its low bit set)."""
+    nbuckets, symoffset, bloom_size, _ = struct.unpack_from('<4I', buf, off)
+    buckets = off + 16 + bloom_size * 8
+    last = max(struct.unpack_from(f'<{nbuckets}I', buf, buckets), default=0)
+    if last < symoffset:
+        return symoffset
+    chain = buckets + nbuckets * 4
+    while not struct.unpack_from('<I', buf, chain + (last - symoffset) * 4)[0] & 1:
+        last += 1
+    return last + 1
 
 
 class Nso:
@@ -58,10 +87,12 @@ class Nso:
         strtab = dyn.get(DT_STRTAB, 0)
         self.strtab = strtab
         self.needed = [self.cstr(strtab + n) for n in needed]
-        # dynsym count from DT_HASH nchain
+        # dynsym count from DT_HASH nchain, else from DT_GNU_HASH (the v1.1.0 update's nnSdk 20 modules have only
+        # that one; runtime/elf_hash.h does the same walk)
         self.syms = []
-        if DT_HASH in dyn and DT_SYMTAB in dyn:
-            nchain = self.u32(dyn[DT_HASH] + 4)
+        nchain = (self.u32(dyn[DT_HASH] + 4) if DT_HASH in dyn else
+                  gnu_hash_nsyms(self.image, dyn[DT_GNU_HASH]) if DT_GNU_HASH in dyn else 0)
+        if nchain and DT_SYMTAB in dyn:
             st = dyn[DT_SYMTAB]
             for i in range(nchain):
                 o = st + i * 24
@@ -75,6 +106,13 @@ class Nso:
                 for i in range(n):
                     r_off, r_info, r_add = struct.unpack_from('<QQq', self.image, b + i * 24)
                     self.relocs.append((r_off, r_info & 0xFFFFFFFF, r_info >> 32, r_add))
+        # Packed relative relocations (the v1.1.0 update's modules have all of theirs there, none in DT_RELA): listed
+        # as R_AARCH64_RELATIVE with the stored word as the addend, like the DT_RELA ones, for gen.py / analyze.py
+        if DT_RELR in dyn and dyn.get(DT_RELRSZ):
+            n = dyn[DT_RELRSZ] // 8
+            entries = struct.unpack_from(f'<{n}Q', self.image, dyn[DT_RELR])
+            for r_off in relr_offsets(entries):
+                self.relocs.append((r_off, R_AARCH64_RELATIVE, 0, struct.unpack_from('<q', self.image, r_off)[0]))
 
     def cstr(self, off):
         end = self.image.index(b'\0', off)

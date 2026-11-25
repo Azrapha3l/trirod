@@ -6,6 +6,8 @@ param(
     # owner/name of the GitHub repository whose Releases the launcher checks (release builds only; empty: the
     # launcher never goes online). docs/RELEASE-WORKFLOW.md
     [string]$UpdateRepo = '',
+    # Compile the generated guest code with its function-entry profiler (EOWRECOMP_FNPROF at run time).
+    [switch]$FnProf,
     [switch]$SkipCompile
 )
 
@@ -16,9 +18,9 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Push-Location $root
 try {
-    $make = '[local path omitted]
-    $msysBin = '[local path omitted]
-    $ucrtBin = '[local path omitted]
+    $make = 'C:\msys64\usr\bin\make.exe'
+    $msysBin = 'C:\msys64\usr\bin'
+    $ucrtBin = 'C:\msys64\ucrt64\bin'
     $python = Join-Path $root 'tools\venv\Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
         $python = Join-Path $root 'build\gen-venv\Scripts\python.exe'
@@ -56,6 +58,7 @@ try {
         $makeBuildDir = $BuildDir.Replace('\', '/')
         $makeArgs = @("-j$Jobs", "B=$makeBuildDir", 'DEPS=build/win/diag-prefix', 'WIN_DEPS=build/win/deps',
                       'ZIG=build/zig/zig.exe', "UPDATE_REPO=$UpdateRepo")
+        if ($FnProf) { $makeArgs += 'FNPROF=1' }
         & $make @makeArgs 'all'
         if ($LASTEXITCODE -ne 0) { throw "TriRod build failed with exit code $LASTEXITCODE." }
     }

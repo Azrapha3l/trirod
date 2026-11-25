@@ -334,6 +334,12 @@ typedef struct {
     uint64_t data_off, data_size;  // the payload under the hash layers, relative to the section
     uint64_t comp_off, comp_size;  // compression table, relative to the payload
     uint8_t comp_hdr[16];
+    uint64_t indirect_off, indirect_size;
+    uint8_t indirect_hdr[16];
+    uint64_t ctr_ex_off, ctr_ex_size;
+    uint8_t ctr_ex_hdr[16];
+    uint8_t meta_hash_type;              // fs header 0x5: patch meta hash type (1 = HierarchicalIntegrity)
+    uint64_t meta_hash_off, meta_hash_size;  // fs header 0x1A0 / 0x1A8: the patch meta hash data (newer updates)
 } Section;
 
 static bool nca_header(int fd, uint64_t base, const Keys *ks, Nca *nca) {
@@ -370,15 +376,20 @@ static bool section_info(const Nca *nca, int i, Section *s) {
     } else return false;
     memcpy(&s->comp_off, fh + 0x178, 8), memcpy(&s->comp_size, fh + 0x180, 8);
     memcpy(s->comp_hdr, fh + 0x188, 16);
+    memcpy(&s->indirect_off, fh + 0x100, 8), memcpy(&s->indirect_size, fh + 0x108, 8);
+    memcpy(s->indirect_hdr, fh + 0x110, 16);
+    memcpy(&s->ctr_ex_off, fh + 0x120, 8), memcpy(&s->ctr_ex_size, fh + 0x128, 8);
+    memcpy(s->ctr_ex_hdr, fh + 0x130, 16);
+    s->meta_hash_type = fh[5];
+    memcpy(&s->meta_hash_off, fh + 0x1A0, 8), memcpy(&s->meta_hash_size, fh + 0x1A8, 8);
     return true;
 }
 
-// decrypted bytes [off, off+n) of a section (off relative to the section)
-static bool section_read(int fd, uint64_t nca_base, const Section *s, const uint8_t key[16], uint8_t *dst, uint64_t off,
-                         size_t n) {
+// AES-CTR bytes [off, off+n) of a section (off relative to the NCA section).
+static bool section_read_ctr(int fd, uint64_t nca_base, const Section *s, const uint8_t key[16], uint8_t *dst,
+                             uint64_t off, size_t n) {
     uint64_t a = off & ~15ull, pre = off - a;
     if (s->enc_type == 1) return pread_all(fd, dst, n, nca_base + s->off + off);
-    if (s->enc_type != 3) return false;
     uint8_t *tmp = pre ? malloc(n + pre) : dst;
     if (!pread_all(fd, tmp, n + pre, nca_base + s->off + a)) { if (pre) free(tmp); return false; }
     uint8_t iv[16];
@@ -390,11 +401,34 @@ static bool section_read(int fd, uint64_t nca_base, const Section *s, const uint
     return true;
 }
 
+// Decrypted bytes [off, off+n) of an ordinary AES-CTR section.
+static bool section_read(int fd, uint64_t nca_base, const Section *s, const uint8_t key[16], uint8_t *dst, uint64_t off,
+                         size_t n) {
+    if (s->enc_type != 1 && s->enc_type != 3) return false;
+    return section_read_ctr(fd, nca_base, s, key, dst, off, n);
+}
+
 // ------------------------------------------------------------------ CompressedStorage
 // BucketTree of CompressedStorage::Entry {s64 virt; s64 phys; u8 type; s8 level; u16; u32 phys_size}, node size
 // 0x4000. Types: 0 none (copy), 1 zeros, 3 LZ4.
 typedef struct { int64_t virt, phys; uint8_t type; uint32_t psize; } CEntry;
 typedef struct { uint8_t *data; uint64_t entry; uint32_t len; uint64_t stamp; } CBlock;
+// AesCtrCounterExtendedStorage::Entry {u8 offset[8]; u8 encryption_value (0 encrypted, 1 not); u8[3]; s32 generation}
+typedef struct { uint64_t phys; uint32_t generation; uint8_t plain; } CtrEntry;
+typedef struct { uint64_t virt, phys; uint32_t storage; } IndirectEntry;
+
+typedef struct {
+    int base_fd;
+    uint64_t base_nca;
+    Section base_sec;
+    uint8_t base_key[16];
+    CtrEntry *ctr;
+    uint64_t nctr, patch_data_size;  // CTR-Ex covers [0, ctr_ex_off) of the section
+    uint64_t indirect_data_size;     // IndirectStorage source 1 is [0, indirect_off) of that
+    IndirectEntry *indirect;
+    uint64_t nindirect, virtual_size;
+} NxPatch;
+
 #define NCACHE 16
 
 struct NxRomfs {
@@ -408,7 +442,75 @@ struct NxRomfs {
     pthread_mutex_t lock;
     CBlock cache[NCACHE];
     uint64_t stamp;
+    NxPatch *patch;
 };
+
+#define BKTR_NODE_SIZE 0x4000u
+
+// Bucket-tree arrays use 0x4000-byte nodes. The root/index nodes come first, then
+// entry-set nodes. Each entry-set node carries its index, count and logical end.
+static bool bktr_nodes(uint8_t *table, size_t table_size, uint32_t count, uint32_t entry_size, uint8_t **sets_out,
+                       uint32_t *set_count_out, uint64_t *end_out) {
+    if (!count || !entry_size) return false;
+    uint32_t per_set = (BKTR_NODE_SIZE - 0x10u) / entry_size;
+    uint32_t set_count = (count + per_set - 1) / per_set;
+    uint32_t per_index = (BKTR_NODE_SIZE - 0x10u) / 8u;
+    uint32_t levels = set_count <= per_index ? 0 : (set_count - per_index + per_index - 2) / (per_index - 1);
+    uint64_t node_bytes = (uint64_t)(1 + levels) * BKTR_NODE_SIZE;
+    if (node_bytes + (uint64_t)set_count * BKTR_NODE_SIZE > table_size) return false;
+    for (uint32_t i = 0; i < set_count; i++) {
+        uint8_t *node = table + node_bytes + (uint64_t)i * BKTR_NODE_SIZE;
+        int32_t idx, n;
+        memcpy(&idx, node, 4);
+        memcpy(&n, node + 4, 4);
+        if (idx != (int32_t)i || n < 0 || (uint32_t)n > per_set) return false;
+        if (i + 1 == set_count) memcpy(end_out, node + 8, 8);
+    }
+    *sets_out = table + node_bytes;
+    *set_count_out = set_count;
+    return true;
+}
+
+static bool ctr_ex_read(NxRomfs *r, uint8_t *dst, uint64_t size, uint64_t off);
+
+// Read the section's decrypted payload. For an update NCA this is the BKTR
+// indirection over base data and the update's AES-CTR-Ex patch data.
+static bool romfs_storage_read(NxRomfs *r, uint8_t *dst, uint64_t size, uint64_t off) {
+    if (r->patch) {
+        NxPatch *p = r->patch;
+        if (off >= p->virtual_size || size > p->virtual_size - off) return false;
+        uint64_t lo = 0, hi = p->nindirect;
+        while (hi - lo > 1) {
+            uint64_t mid = (lo + hi) / 2;
+            if (p->indirect[mid].virt <= off) lo = mid;
+            else hi = mid;
+        }
+        uint64_t done = 0;
+        while (done < size) {
+            IndirectEntry *e = &p->indirect[lo];
+            uint64_t end = lo + 1 < p->nindirect ? p->indirect[lo + 1].virt : p->virtual_size;
+            uint64_t cur = off + done;
+            if (cur < e->virt || cur >= end) return false;
+            uint64_t n = end - cur < size - done ? end - cur : size - done;
+            uint64_t phys = (uint64_t)e->phys + (cur - e->virt);
+            bool ok;
+            if (e->storage == 0)  // the base NCA's whole RomFS section, as Atmosphere's IndirectStorage index 0
+                ok = phys <= p->base_sec.size && n <= p->base_sec.size - phys &&
+                     section_read(p->base_fd, p->base_nca, &p->base_sec, p->base_key, dst + done, phys, (size_t)n);
+            else if (e->storage == 1)  // the update's own data, below its relocation table
+                ok = phys <= p->indirect_data_size && n <= p->indirect_data_size - phys &&
+                     ctr_ex_read(r, dst + done, n, phys);
+            else
+                return false;
+            if (!ok) return false;
+            done += n;
+            if (cur + n == end && lo + 1 < p->nindirect) lo++;
+        }
+        return true;
+    }
+    // (callers already add data_off: off is relative to the section, as in the patch case)
+    return section_read(r->fd, r->nca_base, &r->sec, r->key, dst, off, (size_t)size);
+}
 
 static bool comp_load(NxRomfs *r, char *why, size_t why_size) {
     const uint8_t *h = r->sec.comp_hdr;
@@ -417,9 +519,9 @@ static bool comp_load(NxRomfs *r, char *why, size_t why_size) {
     memcpy(&count, h + 8, 4);
     const uint64_t NODE = 0x4000, ENTRY = 0x18;
     uint8_t *table = malloc(r->sec.comp_size);
-    if (!section_read(r->fd, r->nca_base, &r->sec, r->key, table, r->sec.data_off + r->sec.comp_off, r->sec.comp_size)) {
+    if (!table || !romfs_storage_read(r, table, r->sec.comp_size, r->sec.data_off + r->sec.comp_off)) {
         free(table);
-        return WHY("can't read the compression table (package cut short?)");
+        return WHY("can't read the compression table (package cut short or damaged BKTR map)");
     }
     uint64_t per_set = (NODE - 0x10) / ENTRY, sets = (count + per_set - 1) / per_set, per_node = (NODE - 0x10) / 8;
     uint64_t l2 = sets <= per_node ? 0 : (sets - per_node + per_node - 2) / (per_node - 1);
@@ -446,6 +548,171 @@ static bool comp_load(NxRomfs *r, char *why, size_t why_size) {
     return true;
 }
 
+static bool patch_load(NxRomfs *r, int base_fd, uint64_t base_nca, const Section *base_sec, const uint8_t base_key[16],
+                      char *why, size_t why_size) {
+    Section *s = &r->sec;
+    if (s->enc_type != 4 || memcmp(s->indirect_hdr, "BKTR", 4) || memcmp(s->ctr_ex_hdr, "BKTR", 4))
+        return WHY("the update's RomFS uses encryption type %u without the AES-CTR-Ex table this reads (type 4)",
+                   s->enc_type);
+    uint32_t icount, ccount;
+    memcpy(&icount, s->indirect_hdr + 8, 4);
+    memcpy(&ccount, s->ctr_ex_hdr + 8, 4);
+    // (sizes capped so a damaged header can't ask for gigabytes; overflow-safe range checks)
+    if (!icount || icount > 1000000 || !ccount || ccount > 1000000 || s->indirect_size > (256u << 20) ||
+        s->ctr_ex_size > (256u << 20) || s->indirect_off >= s->ctr_ex_off ||
+        s->indirect_size > s->ctr_ex_off - s->indirect_off || s->ctr_ex_off > s->size ||
+        s->ctr_ex_size > s->size - s->ctr_ex_off)
+        return WHY("the update BKTR table sizes or offsets are invalid");
+
+    // A patch meta hash layer (NcaFsHeaderReader::ExistsPatchMetaHashLayer: meta hash data size != 0 and a relocation
+    // table) puts both tables in one ordinary AES-CTR region, indirect_off .. end of the hash data, under an integrity
+    // layer (fssystem_nca_file_system_driver.cpp CreatePatchMetaStorage). Hashes aren't verified here (as for every
+    // layer: the header comment); without that layer the relocation table is CTR-Ex data.
+    bool meta_layer = s->meta_hash_size != 0;
+    if (meta_layer && (s->meta_hash_type != 1 || s->ctr_ex_off + s->ctr_ex_size > s->meta_hash_off ||
+                       s->meta_hash_off > s->size || s->meta_hash_size > s->size - s->meta_hash_off))
+        return WHY("the update's patch meta hash layer (type %u) is not the supported HierarchicalIntegrity layout",
+                   s->meta_hash_type);
+    NxPatch *p = calloc(1, sizeof *p);
+    if (!p) return WHY("not enough memory for the update BKTR map");
+    p->base_fd = base_fd;
+    p->base_nca = base_nca;
+    p->base_sec = *base_sec;
+    memcpy(p->base_key, base_key, 16);
+    // CTR-Ex backs both patch bytes and the encrypted indirect table; the
+    // counter table itself begins at ctr_ex_off and uses ordinary CTR.
+    p->patch_data_size = s->ctr_ex_off;
+    p->indirect_data_size = s->indirect_off;
+
+    uint8_t *table = malloc((size_t)s->ctr_ex_size);
+    uint8_t *sets = NULL;
+    uint32_t set_count = 0;
+    uint64_t table_end = 0;
+    if (!table || !section_read_ctr(r->fd, r->nca_base, s, r->key, table, s->ctr_ex_off, (size_t)s->ctr_ex_size) ||
+        !bktr_nodes(table, (size_t)s->ctr_ex_size, ccount, 16, &sets, &set_count, &table_end)) {
+        free(table);
+        free(p);
+        return WHY("the AES-CTR-Ex table is incomplete or malformed");
+    }
+    p->ctr = calloc(ccount, sizeof *p->ctr);
+    if (!p->ctr) { free(table); free(p); return WHY("not enough memory for the AES-CTR-Ex table"); }
+    uint32_t ctr_read = 0;
+    for (uint32_t set = 0; set < set_count; set++) {
+        uint8_t *node = sets + (uint64_t)set * BKTR_NODE_SIZE;
+        int32_t n;
+        memcpy(&n, node + 4, 4);
+        for (int32_t i = 0; i < n && ctr_read < ccount; i++, ctr_read++) {
+            const uint8_t *e = node + 0x10 + (uint64_t)i * 16;
+            memcpy(&p->ctr[ctr_read].phys, e, 8);
+            memcpy(&p->ctr[ctr_read].generation, e + 12, 4);
+            p->ctr[ctr_read].plain = e[8];
+            // (entries are AES-block aligned, increasing, inside the data, and either encrypted or not)
+            if ((ctr_read && p->ctr[ctr_read].phys <= p->ctr[ctr_read - 1].phys) ||
+                p->ctr[ctr_read].phys > p->patch_data_size || (p->ctr[ctr_read].phys & 15) || e[8] > 1) {
+                free(table); free(p->ctr); free(p);
+                return WHY("the AES-CTR-Ex entries are out of order");
+            }
+        }
+    }
+    free(table);
+    if (ctr_read != ccount) { free(p->ctr); free(p); return WHY("the AES-CTR-Ex table entry count is inconsistent"); }
+    if (p->ctr[0].phys != 0) { free(p->ctr); free(p); return WHY("the AES-CTR-Ex table does not start at offset zero"); }
+    p->nctr = ccount;
+    r->patch = p;
+
+    uint8_t *ind = malloc((size_t)s->indirect_size);
+    bool ind_ok = ind && (meta_layer ? section_read_ctr(r->fd, r->nca_base, s, r->key, ind, s->indirect_off,
+                                                        (size_t)s->indirect_size)
+                                     : ctr_ex_read(r, ind, s->indirect_size, s->indirect_off));
+    if (!ind_ok) {
+        free(ind); r->patch = NULL; free(p->ctr); free(p);
+        return WHY("can't decrypt the update relocation table");
+    }
+    // IndirectStorage entries are 20 bytes (u64 virtual, u64 physical,
+    // u32 storage index); the bucket capacity in this package is 818.
+    if (!bktr_nodes(ind, (size_t)s->indirect_size, icount, 20, &sets, &set_count, &p->virtual_size)) {
+        free(ind); r->patch = NULL; free(p->ctr); free(p);
+        return WHY("the update relocation table is incomplete or malformed");
+    }
+    p->indirect = calloc(icount, sizeof *p->indirect);
+    if (!p->indirect) { free(ind); r->patch = NULL; free(p->ctr); free(p); return WHY("not enough memory for the update relocation map"); }
+    uint64_t nread = 0;
+    for (uint32_t set = 0; set < set_count; set++) {
+        uint8_t *node = sets + (uint64_t)set * BKTR_NODE_SIZE;
+        int32_t n;
+        memcpy(&n, node + 4, 4);
+        for (int32_t i = 0; i < n && nread < icount; i++, nread++) {
+            const uint8_t *e = node + 0x10 + (uint64_t)i * 20;
+            memcpy(&p->indirect[nread].virt, e, 8);
+            memcpy(&p->indirect[nread].phys, e + 8, 8);
+            memcpy(&p->indirect[nread].storage, e + 16, 4);
+            if (nread && p->indirect[nread].virt <= p->indirect[nread - 1].virt) {
+                uint64_t prev = p->indirect[nread - 1].virt, cur = p->indirect[nread].virt;
+                free(ind); r->patch = NULL; free(p->indirect); free(p->ctr); free(p);
+                return WHY("the update relocation offsets are not increasing at entry %llu (%llx after %llx)",
+                           (unsigned long long)nread, (unsigned long long)cur, (unsigned long long)prev);
+            }
+            if (p->indirect[nread].storage > 1) {
+                uint32_t storage = p->indirect[nread].storage;
+                uint64_t phys = p->indirect[nread].phys, virt = p->indirect[nread].virt;
+                free(ind); r->patch = NULL; free(p->indirect); free(p->ctr); free(p);
+                return WHY("unsupported update relocation source %u at entry %llu (virtual %llx, physical %llx)",
+                           storage, (unsigned long long)nread, (unsigned long long)virt, (unsigned long long)phys);
+            }
+        }
+    }
+    free(ind);
+    if (nread != icount || !p->virtual_size || p->indirect[0].virt != 0 || p->virtual_size < s->data_off + s->data_size) {
+        r->patch = NULL; free(p->indirect); free(p->ctr); free(p);
+        return WHY("the update relocation map does not cover the RomFS payload");
+    }
+    p->nindirect = icount;
+    // (layout facts only, no key or data bytes: which table layout this update has is in its encrypted header)
+    fprintf(stderr, "[nxpkg] update RomFS: %u relocation entries, %u AES-CTR-Ex entries, %s\n", icount, ccount,
+            meta_layer ? "tables under a patch meta hash layer (ordinary AES-CTR)" : "relocation table in AES-CTR-Ex data");
+    return true;
+}
+
+// Decrypt update patch bytes using the generation selected by the AES-CTR-Ex bucket tree.
+static bool ctr_ex_read(NxRomfs *r, uint8_t *dst, uint64_t size, uint64_t off) {
+    NxPatch *p = r->patch;
+    if (!p || off > p->patch_data_size || size > p->patch_data_size - off) return false;
+    uint64_t lo = 0, hi = p->nctr;
+    while (hi - lo > 1) {
+        uint64_t mid = (lo + hi) / 2;
+        if (p->ctr[mid].phys <= off) lo = mid;
+        else hi = mid;
+    }
+    uint64_t done = 0;
+    while (done < size) {
+        const CtrEntry *e = &p->ctr[lo];
+        uint64_t end = lo + 1 < p->nctr ? p->ctr[lo + 1].phys : p->patch_data_size;
+        uint64_t cur = off + done;
+        if (cur < e->phys || cur >= end) return false;
+        uint64_t n = end - cur < size - done ? end - cur : size - done;
+        uint64_t aligned = cur & ~15ull, pre = cur - aligned;
+        uint8_t *tmp = pre ? malloc((size_t)n + (size_t)pre) : dst + done;
+        if (!tmp || !pread_all(r->fd, tmp, (size_t)n + (size_t)pre, r->nca_base + r->sec.off + aligned)) {
+            if (pre) free(tmp);
+            return false;
+        }
+        uint8_t iv[16];
+        // NcaAesCtrUpperIv is {u32 generation; u32 secure_value} (fs header 0x140 / 0x144); the IV's upper half is that
+        // u64 big-endian, so the header's secure_value (ctr_hi[0..3]) comes first, then the entry's generation
+        // (fssystem_aes_ctr_counter_extended_storage.cpp, AesCtrStorage::MakeIv).
+        memcpy(iv, r->sec.ctr_hi, 4);
+        iv[4] = (uint8_t)(e->generation >> 24), iv[5] = (uint8_t)(e->generation >> 16);
+        iv[6] = (uint8_t)(e->generation >> 8), iv[7] = (uint8_t)e->generation;
+        uint64_t block = (r->sec.off + aligned) >> 4;
+        for (int k = 0; k < 8; k++) iv[15 - k] = (uint8_t)(block >> (8 * k));
+        if (!e->plain) nx_aes128_ctr(r->key, iv, tmp, (size_t)n + (size_t)pre);
+        if (pre) memcpy(dst + done, tmp + pre, (size_t)n), free(tmp);
+        done += n;
+        if (cur + n == end && lo + 1 < p->nctr) lo++;
+    }
+    return true;
+}
+
 // the cached, decompressed block of entry i
 static const uint8_t *comp_block(NxRomfs *r, uint64_t i, uint32_t *len) {
     CBlock *victim = &r->cache[0];
@@ -457,7 +724,7 @@ static const uint8_t *comp_block(NxRomfs *r, uint64_t i, uint32_t *len) {
     const CEntry *e = &r->ent[i];
     uint32_t vlen = (uint32_t)(r->ent[i + 1].virt - e->virt);
     uint8_t *raw = malloc(e->psize ? e->psize : 1), *out = malloc(vlen ? vlen : 1);
-    if (!section_read(r->fd, r->nca_base, &r->sec, r->key, raw, r->sec.data_off + (uint64_t)e->phys, e->psize) ||
+    if (!romfs_storage_read(r, raw, e->psize, r->sec.data_off + (uint64_t)e->phys) ||
         nx_lz4_decompress(raw, (int)e->psize, out, (int)vlen) != (int)vlen) {
         free(raw), free(out);
         return NULL;
@@ -474,7 +741,7 @@ ssize_t nx_romfs_pread(NxRomfs *r, void *dst_, uint64_t size, uint64_t off) {
     if (off >= r->size) return 0;
     if (size > r->size - off) size = r->size - off;
     if (!r->ent)
-        return section_read(r->fd, r->nca_base, &r->sec, r->key, dst, r->sec.data_off + off, size) ? (ssize_t)size : -1;
+        return romfs_storage_read(r, dst, size, r->sec.data_off + off) ? (ssize_t)size : -1;
     pthread_mutex_lock(&r->lock);
     uint64_t lo = 0, hi = r->nent;  // last entry with virt <= off
     while (hi - lo > 1) {
@@ -489,8 +756,7 @@ ssize_t nx_romfs_pread(NxRomfs *r, void *dst_, uint64_t size, uint64_t off) {
         uint64_t v = (uint64_t)e->virt, vend = (uint64_t)r->ent[i + 1].virt, o = off + done;
         if (o >= vend) continue;
         uint64_t n = vend - o < size - done ? vend - o : size - done;
-        if (e->type == 0) ok = section_read(r->fd, r->nca_base, &r->sec, r->key, dst + done,
-                                            r->sec.data_off + (uint64_t)e->phys + (o - v), n);
+        if (e->type == 0) ok = romfs_storage_read(r, dst + done, n, r->sec.data_off + (uint64_t)e->phys + (o - v));
         else if (e->type == 1) memset(dst + done, 0, n);
         else if (e->type == 3) {
             uint32_t len;
@@ -510,6 +776,11 @@ void nx_romfs_close(NxRomfs *r) {
     if (!r) return;
     for (int k = 0; k < NCACHE; k++) free(r->cache[k].data);
     free(r->ent);
+    if (r->patch) {  // (its base_fd belongs to the caller's NxProgram)
+        free(r->patch->ctr);
+        free(r->patch->indirect);
+        free(r->patch);
+    }
     if (r->fd >= 0) close(r->fd);
     pthread_mutex_destroy(&r->lock);
     free(r);
@@ -593,6 +864,138 @@ static bool title_key(const Nca *nca, int fd, const Entries *files, const Keys *
     return true;
 }
 
+typedef struct {
+    int fd;
+    uint64_t size, title_id;
+    Entries files;
+    Nca nca;
+    Section exefs, romfs;
+} NxProgram;
+
+static void program_close(NxProgram *p) {
+    if (p->fd >= 0) close(p->fd);
+    free(p->files.e);
+    memset(p, 0, sizeof *p);
+    p->fd = -1;
+}
+
+// Open one package's internal program NCA, independent of its filename. This also
+// handles an update NSP whose program NCA is title-key encrypted by its ticket.
+static bool program_open(const char *package, const char *keys_path, const Keys *ks, NxProgram *p, char *why,
+                         size_t why_size) {
+    memset(p, 0, sizeof *p);
+    p->fd = -1;
+    p->fd = open_package(package);
+    struct stat sb;
+    if (p->fd < 0 || fstat(p->fd, &sb)) return WHY("can't open package %s", package);
+    p->size = (uint64_t)sb.st_size;
+    uint8_t head[0x200];
+    if (!pread_all(p->fd, head, sizeof head, 0)) return WHY("package is too small");
+    if (!memcmp(head, "PFS0", 4)) {
+        if (!read_fs0(p->fd, 0, &p->files)) return WHY("bad NSP package");
+    } else if (!memcmp(head + 0x100, "HEAD", 4)) {
+        uint64_t root;
+        memcpy(&root, head + 0x130, 8);
+        Entries parts = {0};
+        if (!read_fs0(p->fd, root, &parts)) { free(parts.e); return WHY("bad XCI package"); }
+        for (int i = 0; i < parts.n; i++)
+            if (!strcmp(parts.e[i].name, "secure")) read_fs0(p->fd, parts.e[i].off, &p->files);
+        free(parts.e);
+        if (!p->files.n) return WHY("XCI has no secure partition");
+    } else {
+        entries_add(&p->files, "program.nca", 0, p->size);
+    }
+    for (int i = 0; i < p->files.n; i++)
+        if (p->files.e[i].off > p->size || p->files.e[i].size > p->size - p->files.e[i].off)
+            return WHY("package is truncated");
+    bool found = false, any_nca = false;
+    for (int i = 0; i < p->files.n && !found; i++) {
+        size_t len = strlen(p->files.e[i].name);
+        if (len < 4 || strcmp(p->files.e[i].name + len - 4, ".nca")) continue;
+        Nca nca;
+        if (!nca_header(p->fd, p->files.e[i].off, ks, &nca)) continue;
+        any_nca = true;
+        if (nca.hdr[0x205] == 0) p->nca = nca, found = true;
+    }
+    if (!found) return WHY(any_nca ? "package has no program NCA" : "can't decrypt package; check prod.keys");
+    memcpy(&p->title_id, p->nca.hdr + 0x210, 8);
+    int gen = p->nca.hdr[0x206] > p->nca.hdr[0x220] ? p->nca.hdr[0x206] : p->nca.hdr[0x220];
+    int keygen = gen ? gen - 1 : 0;
+    if (memcmp(p->nca.hdr + 0x230, (const uint8_t[16]){0}, 16)) {
+        if (!title_key(&p->nca, p->fd, &p->files, ks, keys_path, keygen, p->nca.ctr_key))
+            return WHY("package needs a title key not present in its ticket or title.keys");
+    } else {
+        char kn[48];
+        snprintf(kn, sizeof kn, "key_area_key_application_%02x", keygen);
+        const uint8_t *kaek = key_get(ks, kn, 16);
+        if (!kaek) return WHY("prod.keys has no %s", kn);
+        uint8_t area[0x40];
+        memcpy(area, p->nca.hdr + 0x300, sizeof area);
+        nx_aes128_ecb_decrypt(kaek, area, sizeof area);
+        memcpy(p->nca.ctr_key, area + 0x20, 16);
+    }
+    if (!section_info(&p->nca, 0, &p->exefs) || !section_info(&p->nca, 1, &p->romfs) || p->exefs.fs_type != 1)
+        return WHY("program NCA has an unexpected ExeFS/RomFS layout");
+    return true;
+}
+
+static bool program_is_patch(const NxProgram *p);
+
+// A package's program by content: title ID, whether it is a patch (BKTR RomFS), and the build ID of its ExeFS main
+// (the NSO header's module ID at 0x40). Reads the NCA header, the ExeFS directory and 0x60 bytes of main; nothing is
+// written. Used to tell base from update and v1.0.0 from v1.1.0 regardless of file names.
+bool nx_identify(const char *package, const char *keys_path, NxPackageInfo *info, char *why, size_t why_size) {
+    memset(info, 0, sizeof *info);
+    Keys ks = {0};
+    if (!keys_load(keys_path, &ks)) return WHY("can't read the keys file");
+    NxProgram p = {.fd = -1};
+    bool ok = false;
+    uint8_t *meta = NULL;
+    if (!program_open(package, keys_path, &ks, &p, why, why_size)) goto out;
+    info->title_id = p.title_id;
+    info->is_patch = program_is_patch(&p);
+    uint8_t h[16];
+    if (!section_read(p.fd, p.nca.base, &p.exefs, p.nca.ctr_key, h, p.exefs.data_off, sizeof h) || memcmp(h, "PFS0", 4)) {
+        WHY("the package's ExeFS doesn't decrypt (wrong keys?)");
+        goto out;
+    }
+    uint32_t count, strsz;
+    memcpy(&count, h + 4, 4), memcpy(&strsz, h + 8, 4);
+    size_t meta_size = 16u + (size_t)count * 0x18u + strsz;
+    if (!count || count > 4096 || strsz > (1u << 20) || meta_size > p.exefs.data_size) {
+        WHY("the package's ExeFS directory is invalid");
+        goto out;
+    }
+    meta = malloc(meta_size);
+    if (!meta || !section_read(p.fd, p.nca.base, &p.exefs, p.nca.ctr_key, meta, p.exefs.data_off, meta_size)) {
+        WHY("can't read the package's ExeFS directory");
+        goto out;
+    }
+    const char *strs = (const char *)meta + 16 + count * 0x18;
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t off, size;
+        uint32_t no;
+        memcpy(&off, meta + 16 + i * 0x18, 8), memcpy(&size, meta + 24 + i * 0x18, 8), memcpy(&no, meta + 32 + i * 0x18, 4);
+        if (no >= strsz || strncmp(strs + no, "main", strsz - no) || size < 0x60) continue;
+        uint64_t room = p.exefs.data_size - meta_size;
+        if (off > room || 0x60 > room - off) break;
+        uint8_t nso[0x60];
+        if (!section_read(p.fd, p.nca.base, &p.exefs, p.nca.ctr_key, nso, p.exefs.data_off + meta_size + off, sizeof nso) ||
+            memcmp(nso, "NSO0", 4))
+            break;
+        memcpy(info->main_build_id, nso + 0x40, sizeof info->main_build_id);
+        info->has_main = true;
+        break;
+    }
+    if (!info->has_main) { WHY("the package's ExeFS has no readable main module"); goto out; }
+    ok = true;
+out:
+    free(meta);
+    program_close(&p);
+    free(ks.k);
+    return ok;
+}
+
 static bool write_file(const char *path, int fd, uint64_t nca_base, const Section *s, const uint8_t key[16], uint64_t off,
                        uint64_t size) {
     FILE *f = fopen(path, "wb");
@@ -648,6 +1051,158 @@ static bool write_romfs_image(NxRomfs *r, const char *path, const char *src, NxP
         remove(path);
         ok = false;
     }
+    return ok;
+}
+
+static bool extract_exefs(const NxProgram *program, const char *out_dir, char *why, size_t why_size) {
+    uint8_t h[16];
+    if (!section_read(program->fd, program->nca.base, &program->exefs, program->nca.ctr_key, h,
+                      program->exefs.data_off, sizeof h) || memcmp(h, "PFS0", 4))
+        return WHY("the update's ExeFS doesn't decrypt as PFS0");
+    uint32_t count, strsz;
+    memcpy(&count, h + 4, 4), memcpy(&strsz, h + 8, 4);
+    if (!count || count > 4096 || strsz > (1u << 20)) return WHY("the update's ExeFS directory is invalid");
+    size_t meta_size = 16u + (size_t)count * 0x18u + strsz;
+    if (meta_size > program->exefs.data_size) return WHY("the update's ExeFS directory is invalid");
+    uint8_t *meta = malloc(meta_size);
+    if (!meta) return WHY("not enough memory to read the update's ExeFS");
+    if (!section_read(program->fd, program->nca.base, &program->exefs, program->nca.ctr_key, meta,
+                      program->exefs.data_off, meta_size)) {
+        free(meta);
+        return WHY("can't read the update's ExeFS directory");
+    }
+    char dir[1200];
+    snprintf(dir, sizeof dir, "%s/exefs", out_dir);
+    mkdir(out_dir, 0755), mkdir(dir, 0755);
+    const char *strs = (const char *)meta + 16 + count * 0x18;
+    bool ok = true;
+    for (uint32_t i = 0; i < count && ok; i++) {
+        uint64_t off, size;
+        uint32_t no;
+        memcpy(&off, meta + 16 + i * 0x18, 8), memcpy(&size, meta + 24 + i * 0x18, 8);
+        memcpy(&no, meta + 32 + i * 0x18, 4);
+        if (no >= strsz) { ok = false; break; }
+        size_t name_len = strnlen(strs + no, strsz - no);
+        if (!name_len || name_len == strsz - no || name_len >= 128 || memchr(strs + no, '/', name_len) ||
+            memchr(strs + no, '\\', name_len) || strs[no] == '.') { ok = false; break; }
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%.*s", dir, (int)name_len, strs + no);
+        // (bounds within the ExeFS payload, checked without overflow)
+        uint64_t room = program->exefs.data_size - meta_size;
+        uint64_t file_off = program->exefs.data_off + meta_size + off;
+        if (off > room || size > room - off)
+            ok = false;
+        else
+            ok = write_file(path, program->fd, program->nca.base, &program->exefs, program->nca.ctr_key, file_off, size);
+    }
+    free(meta);
+    if (!ok) return WHY("can't write the game code files (bad ExeFS or disk full)");
+    return true;
+}
+
+static NxRomfs *romfs_update_open(const NxProgram *base, const NxProgram *update, char *why, size_t why_size) {
+    NxRomfs *r = calloc(1, sizeof *r);
+    if (!r) { snprintf(why, why_size, "not enough memory for the update RomFS"); return NULL; }
+    r->fd = -1;
+    r->fd = dup(update->fd);
+    r->nca_base = update->nca.base;
+    r->sec = update->romfs;
+    memcpy(r->key, update->nca.ctr_key, 16);
+    pthread_mutex_init(&r->lock, NULL);
+    if (r->fd < 0) { snprintf(why, why_size, "can't reopen the update package"); nx_romfs_close(r); return NULL; }
+    if (!patch_load(r, base->fd, base->nca.base, &base->romfs, base->nca.ctr_key, why, why_size)) {
+        nx_romfs_close(r);
+        return NULL;
+    }
+    r->size = r->sec.data_size;
+    if (r->sec.comp_size && !comp_load(r, why, why_size)) { nx_romfs_close(r); return NULL; }
+    return r;
+}
+
+// A patch program NCA: its RomFS section has an IndirectStorage (BKTR) relocation table. (patch_load then refuses the
+// encryption types it doesn't read, AES-CTR-Ex with a skipped or extra hash layer, instead of a silent base-only setup.)
+static bool program_is_patch(const NxProgram *p) { return !memcmp(p->romfs.indirect_hdr, "BKTR", 4); }
+
+// Which of two candidate packages is the base and which its update, from what is inside them
+typedef enum { ROLES_A_BASE, ROLES_B_BASE, ROLES_BASE_ONLY, ROLES_BAD } UpdateRoles;
+static UpdateRoles update_roles(bool a_patch, bool b_ok, bool b_patch, uint64_t a_tid, uint64_t b_tid) {
+    if (!b_ok) return a_patch ? ROLES_BAD : ROLES_BASE_ONLY;  // (an update can't be set up without its base)
+    if (a_patch && b_patch) return ROLES_BAD;
+    if (!a_patch && !b_patch) return ROLES_BASE_ONLY;          // a DLC-less second game, another base: a alone
+    if (a_tid != b_tid) return ROLES_BAD;                      // an update of another program
+    return a_patch ? ROLES_B_BASE : ROLES_A_BASE;
+}
+
+bool nx_setup_update(const char *package_a, const char *package_b, const char *keys_path, const char *out_dir,
+                     uint64_t *title_id, bool *used_update, NxProgress progress, char *why, size_t why_size) {
+    if (used_update) *used_update = false;
+    Keys ks = {0};
+    if (!keys_load(keys_path, &ks)) return WHY("can't read the keys file");
+    bool ok = false;
+    NxProgram base = {.fd = -1}, update = {.fd = -1};
+    NxRomfs *romfs = NULL;
+    if (!program_open(package_a, keys_path, &ks, &base, why, why_size)) goto out;
+    // The second package is only a candidate (the builder picks it by size): a DLC, another game or a damaged file
+    // there must not stop a base-only setup, so anything but an update falls back to nx_setup.
+    char why_b[256] = "";
+    bool b_ok = program_open(package_b, keys_path, &ks, &update, why_b, sizeof why_b);
+    switch (update_roles(program_is_patch(&base), b_ok, b_ok && program_is_patch(&update), base.title_id,
+                         update.title_id)) {
+    case ROLES_A_BASE: break;
+    case ROLES_B_BASE: { NxProgram t = base; base = update, update = t; } break;
+    case ROLES_BASE_ONLY:
+        fprintf(stderr, "[nxpkg] %s is not an update (%s): setting up the base package alone\n", package_b,
+                b_ok ? "no relocation table in its RomFS" : why_b);
+        program_close(&base), program_close(&update);
+        free(ks.k);
+        return nx_setup(package_a, keys_path, out_dir, title_id, progress, why, why_size);
+    case ROLES_BAD:
+        WHY("the packages aren't a base program and its update (an update alone, two updates, or another program's)");
+        goto out;
+    }
+    if (base.title_id != 0x01008CF01BAAC000ull) {
+        WHY("the base and update packages aren't Echoes of Wisdom program NCAs");
+        goto out;
+    }
+    if (title_id) *title_id = update.title_id;
+    // A patch program's ExeFS replaces the base's whole (as Horizon loads it): no base module may be left behind
+    // beside the update's, so only the update's ExeFS is written.
+    if (!extract_exefs(&update, out_dir, why, why_size)) goto out;
+    romfs = romfs_update_open(&base, &update, why, why_size);
+    if (!romfs) goto out;
+    uint64_t magic = 0;
+    if (nx_romfs_pread(romfs, &magic, sizeof magic, 0) != sizeof magic || magic != 0x50) {
+        WHY("the merged update RomFS doesn't have a valid RomFS header");
+        goto out;
+    }
+    char out_image[1200], staging_image[1240], staging_src[1240];
+    snprintf(out_image, sizeof out_image, "%s/romfs.bin", out_dir);
+    snprintf(staging_image, sizeof staging_image, "%s/romfs.update.bin", out_dir);
+    snprintf(staging_src, sizeof staging_src, "%s/romfs.update.src", out_dir);
+    remove(staging_src);
+    if (!write_romfs_image(romfs, staging_image, staging_src, progress, why, why_size)) goto out;
+    // Publish only after the full merged image has been written successfully.
+    char backup[1240];
+    snprintf(backup, sizeof backup, "%s/romfs.previous.bin", out_dir);
+    remove(backup);
+    bool had_old = rename(out_image, backup) == 0;
+    if (rename(staging_image, out_image) != 0) {
+        if (had_old) rename(backup, out_image);
+        remove(staging_image);
+        WHY("can't install the merged update RomFS (%s)", strerror(errno));
+        goto out;
+    }
+    if (had_old) remove(backup);
+    // (an earlier base-only setup's romfs.src holds a derived title key and would now describe the wrong data)
+    char old_src[1240];
+    snprintf(old_src, sizeof old_src, "%s/romfs.src", out_dir);
+    remove(old_src);
+    if (used_update) *used_update = true;
+    ok = true;
+out:
+    if (romfs) nx_romfs_close(romfs);
+    program_close(&base), program_close(&update);
+    free(ks.k);
     return ok;
 }
 

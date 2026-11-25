@@ -8,7 +8,7 @@ generated C, and build outputs stay in ignored folders in this checkout.
 
 ## Toolchain
 
-Install MSYS2 in `[local path omitted]`, open the **UCRT64** shell, update the package database and core (`pacman -Syu`, then
+Install MSYS2, open its **UCRT64** shell, update the package database and core (`pacman -Syu`, then
 close and reopen the shell and repeat until it reports no more updates), then install:
 
 ```sh

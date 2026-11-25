@@ -5,8 +5,12 @@ param(
     [string]$OutputDir = 'build\release',
     # owner/name of the GitHub repository the release will be published in: the launcher must have been built for it
     [Parameter(Mandatory = $true)][string]$UpdateRepo,
-    # the oldest launcher that can install this release (default: this release's own version)
+    # the launcher this release's tools need (default: this release's own version). Informational since the self-update:
+    # the package carries that launcher, and installing the update restarts into it.
     [string]$MinLauncher = '',
+    # the oldest launcher whose self-update can install this package (default: empty, any launcher that has one). Set it
+    # only when the package layout or update.json format changes in a way older self-updates can't apply.
+    [string]$MinUpdater = '',
     # recompile even when the build identifiers did not change
     [switch]$Required
 )
@@ -65,6 +69,7 @@ $manifest = [ordered]@{
     channel = 'windows-x64'
     repository = $UpdateRepo
     min_launcher = $MinLauncher
+    min_updater = $MinUpdater
     required = [bool]$Required
     created = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     build = [ordered]@{ gamelib_id = $tools.gamelib_id; gamebuild_id = $tools.gamebuild_id; protocol = $tools.protocol }

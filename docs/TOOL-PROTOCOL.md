@@ -28,7 +28,8 @@ text, or the exit status when the tool gave no error event.
 | `@@info <text>` | A result worth showing under the stage after it finishes, such as counts or output paths. |
 | `@@warn <text>` | A problem that did not stop the stage. |
 | `@@skip <text>` | The stage was not run. `Trirod-ShaderPrep` leaves shader work to the game in this case. |
-| `@@check ok <text>` / `@@check bad <text>` | The answer to `trbuild check`. |
+| `@@check ok <text>` / `@@check bad <text>` | The answer to `trbuild check`. With packages, `ok` names the base and update found by their contents (program NCA, main build ID), not their file names. |
+| `@@extracted <none\|current\|stale\|incomplete> <text>` | From `trbuild check`: whether `extracted/` matches the chosen files. `stale` = another base, an update added / removed / replaced, another keys file, or another version than the selection makes; `incomplete` = files missing or still to be finished. The launcher offers **Play** only for `current`. |
 | `@@error <text>` | Fatal: the tool stops with a non-zero exit status. |
 | `@@done` | Finished successfully. |
 
@@ -40,9 +41,11 @@ which holds the runtime DLLs.
 | Visible stage | Command | Work |
 | --- | --- | --- |
 | Updating Trirod tools (only when updating) | done by the launcher: WinHTTP download, SHA-256 check, then `%SystemRoot%\System32\tar.exe -xf <zip> -C <stage>` | Download, verify, unpack, and swap the release's tools package |
-| Preparing game files | `trbuild.exe files --data <data> [--source <folder or .xci/.nsp>]` | Finds and checks the player's files, extracts ExeFS and the RomFS image (`nx_setup`, or copy and `romfs_build`), checks title `01008CF01BAAC000` and the v1.0.0 build ID, then runs `trgen --shader-catalog`, which **only copies** BNSH control/code records into `extracted/shader_catalog`. Reuses valid files that are already extracted. |
+| Preparing game files | `trbuild.exe files --data <data> [--source <folder or .xci/.nsp>] [--update <.nsp>]` | Finds the player's files and identifies each package by content (base v1.0.0, update v1.1.0; title `01008CF01BAAC000`). Reuses `extracted/` only when its import record (`extracted/import.txt`: the chosen packages' and keys file's path, size and time, and main's build ID) matches the selection; an extraction from before records is reused when its main is the version the selection makes, and the record is written then. Otherwise it extracts ExeFS and the RomFS image (`nx_setup` / `nx_setup_update`, or copy and `romfs_build`) into `extracted/.import`, checks the main build ID, and only then swaps the new files in (the old ones, with their shader catalog, are removed after the swap; a failed import leaves them as they were). Then runs `trgen --shader-catalog`, which **only copies** BNSH control/code records into `extracted/shader_catalog`. |
 | Translating game code for PC | `trbuild.exe code --data <data>` | `trgen` lifts each ExeFS module to C. Compiles of finished files already run during this stage. |
 | Compiling and linking the generated code | same process (stage event `compile`) | `zig cc` for the remaining files, then links `extracted\Trirod.dll` and `<data>\Trirod.exe` |
 | Preparing shaders for the graphics device | `Trirod-ShaderPrep.exe --data <data>` | See `runtime/tools/shaderprep.c` and `docs/RELEASE-WORKFLOW.md`. A failure or skip does not fail the build. |
 
-`trbuild.exe check --data <data> [--source <path>]` validates a chosen source before **Recompile** is offered.
+`trbuild.exe check --data <data> [--source <path>] [--update <.nsp>]` validates a chosen source before **Recompile** is
+offered and reports what it found and whether the existing extraction is current for it (`@@extracted`). It reads only
+the packages' headers and ExeFS directory; nothing is written.

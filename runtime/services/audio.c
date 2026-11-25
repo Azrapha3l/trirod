@@ -10,6 +10,8 @@
 #include "../hle.h"
 #include "../settings.h"
 #include "../ipc.h"
+#include "audren_delay.h"
+#include "audren_voice.h"
 
 // ------------------------------------------------------------------ audren: a CPU mixer modelled on
 // Ryujinx's AudioRenderer (VoiceState / DataSourceHelper / StateUpdater, copies in notes/ryujinx_audio).
@@ -414,15 +416,32 @@ struct Effect {
     int32_t mix_id;
     uint32_t order;
     Reverb rv;
+    AudrenDelay dly;  // type 3 (audren_delay.h)
 };
 
 // Effect slot update from EffectInParameterVersion1 (0xC0 bytes: type, is_new, enabled, mix, buffers, order, data).
 static void effect_update(Effect *fx, const uint8_t *e) {
-    if (fx->type != e[0]) memset(&fx->rv.p, 0, sizeof fx->rv.p), fx->rv.ready = 0;
+    if (fx->type != e[0]) {
+        memset(&fx->rv.p, 0, sizeof fx->rv.p), fx->rv.ready = 0;
+        audren_delay_free(&fx->dly);
+        memset(&fx->dly, 0, sizeof fx->dly);
+    }
     fx->type = e[0];
     fx->enabled = e[2];
     memcpy(&fx->mix_id, e + 4, 4);
     memcpy(&fx->order, e + 0x18, 4);
+    if (fx->type == 3) {
+        if (audren_delay_update(&fx->dly, e + 0x20, e[1])) {
+            static int logged;  // (once: the units of the game's delay parameters, as received)
+            const AudrenDelayParam *p = &fx->dly.p;
+            if (!logged++ || getenv("EOWRECOMP_AUDIO_LOG"))
+                LOG("[audren] delay init: ch %u/%u time %u/%u ms rate q14 %d (%u samples/ms) gains in %.3f fb %.3f wet "
+                    "%.3f dry %.3f spread %.3f lowpass %.3f\n", p->ch, p->ch_max, p->time_ms, p->time_max_ms,
+                    p->sample_rate, audren_delay_spms(p), audren_q14(p->in_gain), audren_q14(p->feedback),
+                    audren_q14(p->wet), audren_q14(p->dry), audren_q14(p->spread), audren_q14(p->lowpass));
+        }
+        return;
+    }
     if (fx->type != 4) return;
     const uint8_t *d = e + 0x20;
     uint16_t ch_max, ch;
@@ -451,7 +470,24 @@ static void apply_effects(Renderer *r, int32_t mix_id, Mix *m) {
     for (uint32_t order = 0; order < r->effects; order++) {
         for (uint32_t i = 0; i < r->effects; i++) {
             Effect *fx = &r->fx[i];
-            if (fx->type != 4 || fx->mix_id != mix_id || fx->order != order || !fx->rv.ready) continue;
+            if (fx->mix_id != mix_id || fx->order != order) continue;
+            if (fx->type == 3 && fx->dly.ready) {  // delay: same buffer routing as the reverb
+                int ch = fx->dly.p.ch, ok = 1;
+                float *in[6], *out[6];
+                for (int c = 0; c < ch; c++) {
+                    if (fx->dly.p.input[c] >= m->bufs || fx->dly.p.output[c] >= m->bufs) ok = 0;
+                    in[c] = m->buf + (fx->dly.p.input[c] % MIXBUF_MAX) * N;
+                    out[c] = m->buf + (fx->dly.p.output[c] % MIXBUF_MAX) * N;
+                }
+                if (!ok) continue;
+                static int no_delay = -1;
+                if (no_delay < 0) no_delay = getenv("EOWRECOMP_NO_DELAY") ? 1 : 0;
+                if (fx->enabled && !no_delay) audren_delay_process(&fx->dly, in, out, N);
+                else
+                    for (int c = 0; c < ch; c++) if (in[c] != out[c]) memcpy(out[c], in[c], N * sizeof(float));
+                continue;
+            }
+            if (fx->type != 4 || !fx->rv.ready) continue;
             int ch = fx->rv.p.ch;
             float *in[6], *out[6];
             int ok = 1;
@@ -675,7 +711,9 @@ static void *renderer_tick(void *arg) {
 }
 
 static void update_voice(Renderer *r, Voice *v, const uint8_t *p, uint8_t *out) {
-    uint8_t is_new = p[8];
+    AudrenVoiceIn in;  // (REV15 sends the 0x188-byte InParameter2: audren_voice.h)
+    audren_voice_read(p, audren_voice_layout(r->revision), &in);
+    uint8_t is_new = in.is_new;
     if (is_new) {
         memset(v, 0, sizeof *v);
         v->play_state = 1;
@@ -685,39 +723,32 @@ static void update_voice(Renderer *r, Voice *v, const uint8_t *p, uint8_t *out) 
         v->is_new = 1;
     }
     v->in_use = 1;
-    uint8_t ps = p[10];
+    uint8_t ps = in.play_state;
     if (ps == 0) v->play_state = 0;
     else if (ps == 1) { if (v->play_state != 1) v->play_state = 2; }
     else if (ps == 2) v->play_state = 3;
-    v->fmt = p[11];
-    memcpy(&v->rate, p + 12, 4);
-    uint32_t ch;
-    memcpy(&ch, p + 24, 4);
-    v->chans = ch > 6 ? 6 : (uint8_t)ch;
-    memcpy(&v->pitch, p + 28, 4);
-    memcpy(&v->volume, p + 32, 4);
-    memcpy(&v->wb_count, p + 60, 4);
-    memcpy(&v->ds_addr, p + 72, 8);
-    memcpy(&v->mix_id, p + 88, 4);
-    memcpy(&v->splitter_id, p + 92, 4);
-    memcpy(v->chan_ids, p + 320, 24);
-    v->flush += p[345];
-    memcpy(&v->behaviour, p + 348, 2);
-    if (p[344]) v->drop = 0;
-    for (int f = 0; f < 2; f++) {  // BiquadFilterParameter: enable, reserved, s16 numerator[3], denominator[2] (Q14)
-        const uint8_t *b = p + 36 + f * 12;
-        if (b[0] && !v->bq_on[f]) {
+    v->fmt = in.format;
+    v->rate = in.sample_rate;
+    v->chans = in.channels > 6 ? 6 : (uint8_t)in.channels;
+    v->pitch = in.pitch;
+    v->volume = in.volume;
+    v->wb_count = in.wb_count;
+    v->ds_addr = in.src_addr;
+    v->mix_id = in.mix_id;
+    v->splitter_id = in.splitter_id;
+    memcpy(v->chan_ids, in.channel_ids, sizeof v->chan_ids);
+    v->flush += in.flush;
+    v->behaviour = in.flags;
+    if (in.clear_drop) v->drop = 0;
+    for (int f = 0; f < 2; f++) {  // b0 b1 b2 / a1 a2 (Q14 before REV15, floats from it)
+        if (in.bq_on[f] && !v->bq_on[f]) {
             v->bq_reset[f] = 1;
-            if (getenv("EOWRECOMP_AUDIO_LOG")) {
-                int16_t k[5];
-                memcpy(k, b + 2, 10);
-                LOG("[audren] v%ld biquad%d on: %d %d %d / %d %d\n", (long)(v - r->voice), f, k[0], k[1], k[2], k[3], k[4]);
-            }
+            if (getenv("EOWRECOMP_AUDIO_LOG"))
+                LOG("[audren] v%ld biquad%d on: %.4f %.4f %.4f / %.4f %.4f\n", (long)(v - r->voice), f, in.bq[f][0],
+                    in.bq[f][1], in.bq[f][2], in.bq[f][3], in.bq[f][4]);
         }
-        v->bq_on[f] = b[0];
-        int16_t c[5];
-        memcpy(c, b + 2, 10);
-        for (int k = 0; k < 5; k++) v->bq[f][k] = c[k] / 16384.0f;
+        v->bq_on[f] = in.bq_on[f];
+        memcpy(v->bq[f], in.bq[f], sizeof v->bq[f]);
     }
     if (v->splitter_id != 0xFFFFFFFF && v->mix_id < 0) {
         static int warned;
@@ -727,20 +758,20 @@ static void update_voice(Renderer *r, Voice *v, const uint8_t *p, uint8_t *out) 
     if (is_new)
         for (int c = 0; c < v->chans; c++) memset(r->chst[v->chan_ids[c] % r->voices].valid, 0, WB_COUNT);
     for (int i = 0; i < WB_COUNT; i++) {
-        const uint8_t *w = p + 96 + i * 0x38;
+        const AudrenWaveBufferIn *w = &in.wb[i];
         WaveBuf *wb = &v->wb[i];
         if (!cs0->valid[i] && wb->sent) wb->addr = 0;
-        if (!w[26]) {  // !SentToServer: a new buffer for the DSP
-            memcpy(&wb->addr, w, 8);
-            memcpy(&wb->size, w + 8, 8);
-            memcpy(&wb->start, w + 16, 4);
-            memcpy(&wb->end, w + 20, 4);
-            wb->loop = w[24];
-            wb->eos = w[25];
-            memcpy(&wb->loop_count, w + 28, 4);
-            memcpy(&wb->ctx, w + 32, 8);
-            memcpy(&wb->loop_start, w + 48, 4);
-            memcpy(&wb->loop_end, w + 52, 4);
+        if (!w->sent) {  // !SentToServer: a new buffer for the DSP
+            wb->addr = w->addr;
+            wb->size = w->size;
+            wb->start = w->start;
+            wb->end = w->end;
+            wb->loop = w->loop;
+            wb->eos = w->eos;
+            wb->loop_count = w->loop_count;
+            wb->ctx = w->ctx;
+            wb->loop_start = w->loop_start;
+            wb->loop_end = w->loop_end;
             if ((r->revision >> 24) - '0' < 8) {  // WaveBuffer version 1: loop forever over [start, end)
                 wb->loop_count = -1;
                 wb->loop_start = wb->loop_end = 0;
@@ -828,7 +859,8 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
             LOG("[audren] dumped %s (%llu bytes, rev %08x)\n", path, (unsigned long long)in->size, r->revision);
         }
     }
-    uint32_t npools = pools_sz / 0x20, nvoices = voices_sz / 0x170, neffects = effects_sz / 0xC0;
+    const uint32_t vstride = audren_voice_layout(r->revision)->size;  // 0x170, or 0x188 from REV15
+    uint32_t npools = pools_sz / 0x20, nvoices = voices_sz / vstride, neffects = effects_sz / 0xC0;
     uint32_t nchans = chans_sz / 0x70, nsinks = sinks_sz / 0x140;
     if (nvoices > r->voices) nvoices = r->voices;
     if (nchans > r->voices) nchans = r->voices;
@@ -859,7 +891,7 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
     oh[3] = r->voices * 0x10;
     for (uint32_t i = 0; i < r->voices; i++) r->voice[i].in_use = 0;
     for (uint32_t i = 0; i < nvoices && o + 0x10 <= out->size; i++, o += 0x10) {
-        const uint8_t *v = vin + i * 0x170;
+        const uint8_t *v = vin + i * vstride;
         if (v[9]) update_voice(r, &r->voice[i], v, op + o);
     }
     // effects (not processed): report them as enabled/disabled per request
@@ -875,7 +907,7 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
         static uint32_t seen_types;
         if (e[0] && e[0] < 32 && !(seen_types & (1u << e[0]))) {
             seen_types |= 1u << e[0];
-            LOG("[audren] effect type %u used%s: slot %u mix %d enabled %u\n", e[0], e[0] == 4 ? "" : " (not implemented)", i,
+            LOG("[audren] effect type %u used%s: slot %u mix %d enabled %u\n", e[0], e[0] == 3 || e[0] == 4 ? "" : " (not implemented)", i,
                 *(const int32_t *)(e + 4), e[2]);
         }
         if (e[0] && getenv("EOWRECOMP_AUDIO_LOG")) {

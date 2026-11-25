@@ -6,7 +6,7 @@ The code addresses also name the optional shader dumps, so the log can be matche
 
 ## Capture shader and draw information on Windows
 
-Open PowerShell in the game's output folder (for example, `[local path omitted]`) and run:
+Open PowerShell in the game's output folder (for example, the folder containing `eowrecomp.exe`) and run:
 
 ```powershell
 $env:EOWRECOMP_LOG_DRAWS = "1"
@@ -43,7 +43,7 @@ the recompiler's known function entries. The diagnostic line now includes the gu
 or `bl`), source instruction address, target, LR, and several argument/scratch registers. This distinguishes an
 indirect function call from a computed branch before investigating the AArch64 decoder and function-boundary scan.
 
-On Windows, open PowerShell in `[local path omitted]` and run this to capture the failure:
+On Windows, open PowerShell in the folder containing `eowrecomp.exe` and run this to capture the failure:
 
 ```powershell
 Remove-Item .\missing-function.log -ErrorAction SilentlyContinue

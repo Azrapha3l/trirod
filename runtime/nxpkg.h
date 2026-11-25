@@ -17,6 +17,20 @@ extern "C" {
 typedef void (*NxProgress)(uint64_t done, uint64_t total);
 bool nx_setup(const char *package, const char *keys, const char *out_dir, uint64_t *title_id, NxProgress progress, char *why,
               size_t why_size);
+// A base package and an update candidate, in either order (roles come from the program NCAs' contents): writes the
+// update's ExeFS and the BKTR-merged RomFS. When the candidate is not a patch of the same program (a DLC, another
+// game, unreadable), sets up the base alone like nx_setup and leaves *used_update false.
+bool nx_setup_update(const char *package_a, const char *package_b, const char *keys, const char *out_dir,
+                     uint64_t *title_id, bool *used_update, NxProgress progress, char *why, size_t why_size);
+
+// What a package holds, read from its program NCA (not its file name): the title, whether it is an update (a patch
+// program, BKTR RomFS), and its ExeFS main's build ID. Reads a few KB; writes nothing. false = unreadable (why).
+typedef struct {
+    uint64_t title_id;
+    bool is_patch, has_main;
+    uint8_t main_build_id[32];
+} NxPackageInfo;
+bool nx_identify(const char *package, const char *keys, NxPackageInfo *info, char *why, size_t why_size);
 
 typedef struct NxRomfs NxRomfs;
 // Used during setup to materialize the RomFS image from the package description. NULL = missing / changed (why).

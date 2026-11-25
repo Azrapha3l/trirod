@@ -130,7 +130,7 @@ while read -r f; do
     newer "$m" "$NEWEST" && NEWEST=$m
     [ -n "$MIN" ] && newer "$m" "$MIN" && TOO_NEW+="  ${f#$APP/} (macOS $m)"$'\n'
 done < <(machos)
-if [ -n "$TOO_NEW" ]; then printf 'built for newer than macOS %[local path omitted] "$MIN" "$TOO_NEW"; exit 1; fi
+if [ -n "$TOO_NEW" ]; then printf 'built for newer than macOS %s:\n%s' "$MIN" "$TOO_NEW"; exit 1; fi
 MIN=${MIN:-$NEWEST}
 
 cat > "$C/Info.plist" <<EOF

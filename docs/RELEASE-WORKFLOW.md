@@ -44,23 +44,48 @@ The launcher checks `tools\trirod-tools.json` (version, `gamelib_id`, `gamebuild
   the order `alpha_<n>` < `beta_<n>` < `v<x.y.z>`. A newer release is marked as requiring a recompile when its
   `build.gamelib_id` or `build.gamebuild_id` differs from the installed tools, or when it sets `required: true`.
   The launcher then offers **Update and recompile**, or **Update** with **Play installed version** when no
-  recompile is needed. A release whose `min_launcher` is newer than the running launcher is not installed; the
-  launcher shows the release page instead. If the check fails or the build has no `UPDATE_REPO`, the reason is
-  shown and everything else keeps working.
+  recompile is needed. Every update replaces the launcher as well and restarts into it (below), so a release whose
+  `min_launcher` is newer than the running launcher is installed like any other ("includes a new launcher: it
+  restarts"). Only a release whose `min_updater` is newer than the running launcher is refused, with its release page
+  shown: set that when the package or update format changes in a way older self-updates can't apply. Launchers
+  built before the self-update (v0.1.0) still refuse any release whose `min_launcher` is newer than themselves:
+  their users install the first self-updating release by hand. If the check fails or the build has no
+  `UPDATE_REPO`, the reason is shown and everything else keeps working.
 
 ## Recompile (and the build after an update)
 
 All stages are visible. Each shows its tool's command line, current activity, and percentage. **Show details**
 streams every line of tool output; the same text is written to `logs\last-build.log`.
 
-1. *Updating Trirod tools* (only when updating): the launcher downloads only the `kind: "tools"` asset that the
-   manifest names, from `https://github.com/<UPDATE_REPO>/releases/download/...`. It checks the size and SHA-256
-   against the manifest, then unpacks the zip with `%SystemRoot%\System32\tar.exe` into
-   `updates\<version>\stage`. It also checks that the unpacked `tools\trirod-tools.json` reports the manifest's version.
-   It refuses packages whose top level contains player data names (`extracted`, `cache`, `save`, `Trirod.exe`,
-   settings, and so on). Each top-level entry is moved aside into `updates\<version>\previous`, then the new entry is
-   moved in. If any move fails, everything is moved back. Game files, saves, settings, caches, and the built game are
-   never touched.
+1. *Updating Trirod tools* (only when updating). The package replaces the launcher too, and a running executable
+   can't be replaced, so the **new** launcher installs it after the old one has closed
+   (`runtime/launcher/launcher_win.cpp`, "self-update"):
+   - The running launcher downloads only the `kind: "tools"` asset that the manifest names, from
+     `https://github.com/<UPDATE_REPO>/releases/download/...`, checks its size and SHA-256 against the manifest, and
+     unpacks it with `%SystemRoot%\System32\tar.exe` into `updates\<version>\stage`. It checks that
+     `tools\trirod-tools.json` reports the manifest's version, that the top level holds no player data names
+     (`extracted`, `cache`, `save`, `Trirod.exe`, settings, and so on), that `Trirod-Launcher.exe`, `trbuild.exe`,
+     `Trirod-ShaderPrep.exe`, `SDL3.dll` and `tools\trirod-tools.json` are there, and that the staged
+     `Trirod-Launcher.exe --version` starts and reports the release's version. It writes `updates\<version>\update.json`
+     (installation and data folders, `--dev` / `--console`, whether a recompile follows).
+   - It starts `stage\Trirod-Launcher.exe --apply-update <dir> --wait-pid <its pid>` and closes once that signals it
+     has started. If any check fails or no signal comes within 30 s, the update fails with the reason and the
+     installed version is unchanged and still open.
+   - The staged launcher waits for the old process to end, then moves each installed top-level entry aside into
+     `updates\<version>\previous` and the package's entry in. It starts the installed (new) launcher with the same
+     `--data`, `--dev` and `--console`, plus `--updated <version>` and `--recompile` when the release needs a recompile,
+     and waits up to 60 s for it to start drawing. Then it removes older `updates\` folders and exits.
+   - If a move fails (a file in use) or the new launcher doesn't start, everything is moved back and the previous
+     launcher is started with `--update-error <reason>`, which it shows. Each step is logged in
+     `updates\<version>\apply.log`.
+   - Only one launcher runs per installation and data folder; a second shows "already running" and exits. The restarted
+     launcher waits for the closing one. After the restart, the installed version equals the release's, so the update
+     isn't offered again.
+   - Game files, saves, settings, caches and the built game are never touched. The previous version stays in
+     `updates\<version>\previous` until the next update.
+   - `--update-from <folder>` reads a release from disk (its `trirod-release.json` and the zip it names) instead of
+     GitHub, also in development mode, with the same checks; `--update` starts the update as soon as the check finds a
+     newer release. `tools/test_self_update.ps1` uses both for its end-to-end test.
 2. *Preparing game files*: `trbuild files`.
 3. *Translating game code for PC* and 4. *Compiling and linking the generated code*: `trbuild code`. Generated C and
    objects in `.gamebuild` are reused when their content keys still match. `Trirod.dll` and `Trirod.exe` are replaced
@@ -152,8 +177,8 @@ only a copy whose `--version` runtime ID matches `Trirod.exe.id`, so a stale cop
 - The optimized replacement is the complete pipeline for the same state, built on a low-priority worker (as in
   DXVK).
 - Libraries are never linked with link-time optimization: that needs RETAIN info. Without it the link is invalid and
-  drew nothing on NVIDIA; with it the cache grows.
-- Cost measured on an test GPU: the catalog's 7405 library pairs take about 1.13 GB of `vk_pipelines.bin`, and game
+  drew nothing on the tested GPU; with it the cache grows.
+- Cost measured on the test system: the catalog's 7405 library pairs take about 1.13 GB of `vk_pipelines.bin`, and game
   start to the title was 2–6 s slower with that cache.
 
 **In the game: prepared pipelines are built at boot.** Setup's preparation fills only the driver's cache. Each
@@ -162,7 +187,7 @@ pipeline still needs its program translated by the runtime (one serialized trans
 
 So before the game starts, `Trirod.exe` builds every recorded recipe from `cache\warm` on the shader threads, as TOTK
 does with pipeline keys seen in play and Triforce with its precompile at start.
-- With a prepared cache, 1133 pipelines took 1.7 s on an test GPU, every one from the driver cache.
+- With a prepared cache, 1133 pipelines took 1.7 s on the test system, every one from the driver cache.
 - A progress panel appears if it takes longer than 0.3 s; Esc or B starts the game while the rest keeps building.
 - `EOWRECOMP_VK_WARM_WAIT=<s>` sets the longest wait (default 180 s); `EOWRECOMP_VK_WARM=0` turns recipes off.
 - Optimized replacements of fast-linked pipelines run on an idle tier, so they never delay this build or any draw.
@@ -196,7 +221,7 @@ The runtime does not export captures automatically. After playing a development 
 the tracked catalog from the repository root:
 
 ```powershell
-python tools\export_shader_warm.py "[local path omitted]"
+python tools\export_shader_warm.py "D:\path\to\Trirod-data\cache"
 ```
 
 The exporter validates each recipe checksum and referenced shader-code hash, merges with the existing catalog, and
@@ -204,7 +229,7 @@ writes only `shader_catalog\warm\recipes.bin` plus its `code\` records. Review a
 update. `setup/pack_tools.ps1` includes only that curated directory under `tools\shader_catalog\warm` in the install;
 `setup/check_package.ps1` still rejects driver caches, raw `.spv` files, game archives, and other game data.
 
-Measured on 2026-11-23 on the development PC (test GPU, driver [driver details omitted]), in a scratch data folder with a
+Measured on 2026-11-23 on a test system (specific GPU and driver details omitted), in a scratch data folder with a
 copy of that install's recipes:
 
 - 967 recorded pipelines (502 programs) built in 178.6 s with an empty driver cache, and in 1.5 s on a second run.

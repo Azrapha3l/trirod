@@ -10,7 +10,7 @@ The user clarified that the stretched object is Link/the character, not the terr
 - `runtime/nvn/vulkan/exec.c` now has opt-in diagnostics:
   - `EOWRECOMP_DEBUG_VERTEX_LAYOUT=1` logs vertex attribute formats/offsets and the first bytes for shader `0x72ee695400`.
   - `EOWRECOMP_SKIP_VS=<address>` skips all draws using a guest vertex shader; `<address>:<index count>[,<index count>...]` skips only selected indexed draw sizes.
-- Windows runtime build succeeds with MSYS2 UCRT64. `build/win-native/eowrecomp.exe` includes these diagnostics. It has **not** been copied to `[local path omitted]`; it is a diagnostic build, not a user fix.
+- Windows runtime build succeeds with MSYS2 UCRT64. `build/win-native/eowrecomp.exe` includes these diagnostics. It has **not** been copied to `the game data folder`; it is a diagnostic build, not a user fix.
 - All diagnostic test processes started in this work were stopped after the frame capture.
 
 ## Findings from frame 9000
@@ -70,7 +70,7 @@ At frame 8900, the corrected logger captured the actual cbuf mapping in `build/w
 - The 4506 batch has stride 40: position `0x22` float3 at offset 0; weights `0x2A` RGBA16_UNORM at offset 12; packed normal `0x69` at offset 20; joint indices `0x27` RGBA8_UINT at offset 36.
 - Its first vertex has weights bytes `33 33 cc cc 00 00 00 00`, which decode as UNORM16 weights `0.2, 0.8, 0, 0`; its four index bytes are `6a 03 04 04` (106, 3, 4, 4).
 - Generated GLSL for VS `0x72ee694000` uses values from `a7` to calculate dynamic cbuf 6 offsets in 48-byte steps. If those lanes are the skin joint indices, index 106 is outside the 58-entry cbuf 6 range despite a nonzero first weight. This is a strong lead, but still needs confirmation against the full per-vertex attribute stream, the exact shader branch, and RenderDoc or an equivalent draw inspection. It could indicate a bad attribute interpretation, palette/range mismatch, or CPU-side palette write problem.
-- The cbuf mapping correction fixed the diagnostic; it has not changed rendering. The game process was stopped after this capture. The latest diagnostic executable remains in `build/win-native/eowrecomp.exe` and was not copied into `[local path omitted]`.
+- The cbuf mapping correction fixed the diagnostic; it has not changed rendering. The game process was stopped after this capture. The latest diagnostic executable remains in `build/win-native/eowrecomp.exe` and was not copied into `the game data folder`.
 
 ## Reference audit
 
@@ -78,7 +78,7 @@ At frame 8900, the corrected logger captured the actual cbuf mapping in `build/w
 - **Triforce** (`references/triforce-source/gpu/render/rx_draw.cpp`, `rx_shader.cpp`): decodes vertex inputs according to the game's recorded format/offset/stride and falls back to explicit CPU conversion when WebGPU cannot express a layout. It builds viewport/depth conversion data per draw because WebGPU's viewport convention differs. This is a helpful validation pattern, but its WebGPU draw backend is not directly portable to EoW's Vulkan path.
 - **Eden mirror** (`references/mirror/src/video_core/renderer_vulkan/vk_rasterizer.cpp`, `fixed_pipeline_state.cpp`, and `src/shader_recompiler`): the Vulkan rasterizer derives Y behavior from the Maxwell window-origin mode, applying a negative viewport height for lower-left origin; depth-mode conversion is handled separately. Its shader frontend is a useful Maxwell instruction-semantics reference, but Eden is an emulator rather than a drop-in NVN recompilation runtime.
 - EoW's enum mapping matches the local TOTK/Triforce headers: lower-left origin is `0`, upper-left is `1`; unsigned byte/short/int indices are `0/1/2`. EoW currently flips shader Y for lower-left origin and uses a negative-height viewport. The earlier no-flip diagnostic changed the symptom but did not fix it; reference agreement makes a global Vulkan Y-convention mismatch less likely.
-- RenderDoc 1.47.0 was installed from the verified WinGet package and its installer hash matched. The local installation has `qrenderdoc.exe`, `renderdoccmd.exe`, `renderdoc.dll`, and `renderdoc_app.h`, but **does not contain `renderdoc.pyd` anywhere under `[local path omitted] Files\RenderDoc`**. The current Codex session has no RenderDoc MCP server connected. The user reported that the MCP route is not working as expected; do not pursue MCP setup unless they ask again. RenderDoc UI/CLI remains installed for a later manual capture.
+- RenderDoc 1.47.0 was installed from the verified WinGet package and its installer hash matched. The local installation has `qrenderdoc.exe`, `renderdoccmd.exe`, `renderdoc.dll`, and `renderdoc_app.h`, but **does not contain `renderdoc.pyd` anywhere under the RenderDoc installation folder**. The current Codex session has no RenderDoc MCP server connected. The user reported that the MCP route is not working as expected; do not pursue MCP setup unless they ask again. RenderDoc UI/CLI remains installed for a later manual capture.
 
 ## Next steps
 
@@ -93,10 +93,10 @@ The sandbox blocks MSYS2 startup with `NtCreateDirectoryObject`; an approved ele
 ```powershell
 $buildScript = @'
 export PATH=/ucrt64/bin:/usr/bin:$PATH
-cd [local path omitted]
+cd /path/to/EoW-Recomp
 make -j8 B=build/win-native DEPS=build/win/diag-prefix build/win-native/eowrecomp.exe
 '@
-$buildScript | & '[local path omitted] -s
+$buildScript | & (Join-Path $env:MSYS2_ROOT 'usr\bin\bash.exe') -s
 ```
 
 For a capture with a selected mesh batch omitted (previously tried; results were inconclusive):
@@ -109,4 +109,4 @@ $env:EOWRECOMP_SKIP_VS='72ee694000:3465,918,1320,2424'
 & .\eowrecomp.exe *> .\character-skip-group-a.log
 ```
 
-Run from `[local path omitted]`; stop the game after `build/pass_9000_038.png` is saved. The current working tree already has many user/project changes; do not reset or discard unrelated modifications.
+Run from the repository's `build/win-native` output folder; stop the game after `build/pass_9000_038.png` is saved. The current working tree already has many user/project changes; do not reset or discard unrelated modifications.

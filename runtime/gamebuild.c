@@ -545,7 +545,8 @@ static bool start_gen(const Tools *t, Gen *g, const char *game_dir, const char *
 static bool prepare_shader_catalog(const Tools *t, const char *game_dir, const GameBuildOpts *o, char *why, size_t why_size) {
     char manifest[1200], romfs[1200], main[1200], out[1200], log[1200], work[1200];
     snprintf(manifest, sizeof manifest, "%s" SEP "shader_catalog" SEP "manifest.json", game_dir);
-    if (file_exists(manifest)) return true;  // the game version is fixed and extraction never mixes updates
+    // (the catalog belongs to its extraction: a new import replaces both, trbuild import_selection / IMPORT_SET)
+    if (file_exists(manifest)) return true;
     snprintf(romfs, sizeof romfs, "%s" SEP "romfs", game_dir);
     if (!file_exists(romfs)) snprintf(romfs, sizeof romfs, "%s" SEP "romfs.bin", game_dir);
     snprintf(main, sizeof main, "%s" SEP "exefs" SEP "main", game_dir);

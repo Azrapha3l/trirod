@@ -110,7 +110,7 @@ static void unpack_tools_archive(void) {
     // spaces and apostrophes in an install directory remain data, not executable syntax.
     wchar_t exe[MAX_PATH], cmd[8192];
     DWORD n = GetEnvironmentVariableW(L"SystemRoot", exe, MAX_PATH);
-    if (!n || n >= MAX_PATH) wcscpy_s(exe, MAX_PATH, L"[local path omitted]\Windows");
+    if (!n || n >= MAX_PATH) wcscpy_s(exe, MAX_PATH, L"C:\\Windows");
     size_t used = wcslen(exe);
     if (used + 64 >= MAX_PATH) return;
     wcscat_s(exe, MAX_PATH, L"\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
@@ -262,7 +262,10 @@ bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
 // ---- game files
 // What the setup (runtime/ui/launcher.mm) creates in extracted/, plus what older versions' extraction and manual
 // extractions left there (never read at run time).
-static const char *const GAME_FILES[] = {"exefs", "romfs", "romfs.bin", "romfs.src", "shader_catalog", "keys", GAMELIB_NAME, GAMELIB_NAME ".id", "eowgame.dll", "eowgame.dll.id", ".gamebuild",
+static const char *const GAME_FILES[] = {"exefs", "romfs", "romfs.bin", "romfs.src", "romfs.bin.tmp", "romfs.src.tmp",
+                                         "romfs.update.bin", "romfs.update.bin.tmp", "romfs.previous.bin", "shader_catalog", "keys",
+                                         "import.txt", "import.txt.tmp", ".import", ".previous",  // runtime/tools/import_state.h
+                                         GAMELIB_NAME, GAMELIB_NAME ".id", "eowgame.dll", "eowgame.dll.id", ".gamebuild",
                                          ".extract", "extract.log", "xci_secure", "nso_raw", "update_pfs", ".DS_Store"};
 
 // game_dir must be <data root>/extracted, a real folder (a dev worktree's symlinked extracted/ is refused)

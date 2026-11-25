@@ -27,6 +27,22 @@ class CatalogError(Exception):
     pass
 
 
+# main's build ID (NSO header 0x40, first 8 bytes) -> game version (docs/STATUS.md; runtime/tools/trbuild.c)
+GAME_VERSIONS = {"a581406bc9858651": "1.0.0", "9f221e1afa65ba54": "1.1.0"}
+
+
+def game_version(main: Path | None) -> tuple[str, str]:
+    """(version, main build id hex) of the ExeFS main the catalog was made with; "unknown" without one."""
+    if main is None:
+        return "unknown", ""
+    with main.open("rb") as f:
+        head = f.read(0x60)
+    if len(head) < 0x60 or head[:4] != b"NSO0":
+        return "unknown", ""
+    build_id = head[0x40:0x60].rstrip(b"\0").hex()
+    return GAME_VERSIONS.get(build_id[:16], "unknown"), build_id
+
+
 def u32(data: bytes, off: int) -> int:
     if off < 0 or off + 4 > len(data):
         raise CatalogError(f"u32 at {off:#x} is outside the archive")
@@ -163,7 +179,8 @@ def scan_data(data, label: str):
     return records, programs, found, errors
 
 
-def write_catalog(outdir: Path, stages: dict[str, dict], programs: list[dict], stats: dict) -> None:
+def write_catalog(outdir: Path, stages: dict[str, dict], programs: list[dict], stats: dict,
+                  version: tuple[str, str] = ("unknown", "")) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     stage_ids = {key: i for i, key in enumerate(sorted(stages))}
     stage_rec_size, program_rec_size = 56, 28
@@ -200,7 +217,8 @@ def write_catalog(outdir: Path, stages: dict[str, dict], programs: list[dict], s
         "format": "EOW_SHADER_CATALOG",
         "schema": 1,
         "game": "The Legend of Zelda: Echoes of Wisdom",
-        "game_version": "1.0.0",
+        "game_version": version[0],  # (was always "1.0.0"; the update's shaders are catalogued the same way)
+        "main_build_id": version[1],
         "stages": manifest_stages,
         "programs": programs,
         "scan": stats,
@@ -221,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.main is not None and not args.main.is_file():
         ap.error(f"ExeFS/main does not exist: {args.main}")
     stages, programs, stats = scan(args.romfs, args.main)
-    write_catalog(args.outdir, stages, programs, stats)
+    write_catalog(args.outdir, stages, programs, stats, game_version(args.main))
     print(f"shader catalog: {len(stages)} unique stages, {len(programs)} program variations, "
           f"{stats['bnsh_signatures']} BNSH signatures in {stats['files_scanned']} files; "
           f"{len(stats['parse_errors'])} malformed/unrecognized BNSH blocks", file=sys.stderr)

@@ -55,8 +55,9 @@ def read_catalog(root: Path, portable_only: bool = False) -> tuple[dict[bytes, b
     schema, rec_bytes, vendor, device, count = struct.unpack_from("<IIIII", raw, 8)
     if rec_bytes != RECORD_BYTES or schema not in (SCHEMA_LOCAL, SCHEMA_PORTABLE):
         raise ExportError(f"{recipe_path}: unsupported schema/record size ({schema}, {rec_bytes})")
-    if schema == SCHEMA_PORTABLE and (vendor or device):
-        raise ExportError(f"{recipe_path}: portable schema must use wildcard GPU IDs")
+    # Runtime caches use schema 2 as well, but retain their source GPU IDs so the
+    # game only reuses those recipes on that device. write_catalog() clears both
+    # IDs when exporting the records into the shared portable catalog.
     if portable_only and (schema != SCHEMA_PORTABLE or vendor or device):
         raise ExportError(f"{recipe_path}: expected a portable schema-2 catalog")
     available = (len(raw) - 32) // RECORD_BYTES

@@ -3314,8 +3314,8 @@ static VkDescriptorBufferInfo gmem_info(void) {
 }
 
 // Compute dispatches that use global memory: the imported heap is host memory across PCIe on a discrete GPU, and a
-// shader storing to it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~8 ms a frame on a test GPU
-// Super and on an test GPU alike, which the game then waits for on its fence - 49-53 fps there on the 1660). Before
+// shader storing to it in a loop crawls (the little chain chomps in a house area: ~8 ms a frame on two tested GPUs, which the game then waits for
+// on its fence - 49-53 fps on the slower test GPU. Before
 // such a dispatch its bound storage buffers (sorted, merged) are copied into a device-local buffer, the address table
 // (binding GMAP_BUFFER_INDEX) tells the shader (translate.c, GLSL compute) where each range sits, loads and stores
 // inside them use that copy, and a shader that stores gets the ranges copied back to the heap right after it (the
@@ -3458,7 +3458,7 @@ static void gfast_finish(VkCommandBuffer cb) {
 
 // ---- vertex / index cache
 // Reading vertex / index data in place from the imported heap crosses PCIe for every vertex fetched on a discrete GPU
-// (outdoors at 3x internal resolution on an test GPU: ~0.7-1.9 ms of GPU a frame; more on PCIe 3.0), and copying it
+// (outdoors at 3x internal resolution on a tested GPU: ~0.7-1.9 ms of GPU a frame; more on PCIe 3.0), and copying it
 // per draw instead moves about as much onto the CPU. So each range bound for drawing gets a device-local copy, refreshed
 // only where the CPU wrote since (the OS's page write tracking, plat_written_pages, asked at submission: vc_flush): one
 // sequential GPU copy of the written pages in the submission's upload buffer (which completes before its draws) instead

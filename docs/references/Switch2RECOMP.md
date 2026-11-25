@@ -2,7 +2,7 @@
 
 Repository: <https://github.com/SwitchRECOMP-Dev/Switch2RECOMP>
 
-Local checkout: `[local path omitted]`
+Local reference checkout (path omitted).
 
 Revision inspected: `63e385b` (`main` at the time this reference was added).
 

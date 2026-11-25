@@ -1,7 +1,7 @@
 # Building on macOS (Apple Silicon)
 
 EoWRecomp runs on macOS through the same Vulkan backend as every other platform, on Apple's Metal via
-[MoltenVK](https://github.com/KhronosGroup/MoltenVK). Tested on a Apple Silicon laptop with macOS 27 and MoltenVK
+[MoltenVK](https://github.com/KhronosGroup/MoltenVK). Tested with MoltenVK
 1.4.2. (The Metal renderer inherited from LAS Recomp is still in the tree, `make MACOS_BACKEND=metal`, but it has
 none of the Echoes of Wisdom fixes.)
 

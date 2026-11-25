@@ -386,6 +386,7 @@ static std::vector<LogLine> g_log;
 static FILE *g_log_file;
 static std::atomic<bool> g_busy{false}, g_cancel{false};
 static std::string g_status, g_error;       // the headline under the title; the last failure
+static std::string g_notice;                 // a one-time note (the self-update: "Updated to ...")
 static bool g_build_ok_once;                 // a build finished in this session
 static HANDLE g_job;                         // the running tool and everything it started (Cancel ends them)
 
@@ -409,7 +410,7 @@ static Step *step(const std::string &id) {
 // ================================================================== running a tool
 // One child: stdout read for "@@" events (the rest is output), stderr as output; both into the details and the
 // build log. In a job object, so Cancel (or the launcher closing) ends the tool and the compilers it started.
-struct ToolResult { int exit = -1; std::string error, check; bool done = false, skipped = false; std::string skip; };
+struct ToolResult { int exit = -1; std::string error, check, extracted, version; bool done = false, skipped = false; std::string skip; };
 
 static void handle_event(const std::string &line, ToolResult &r) {
     // line without the "@@"
@@ -445,6 +446,8 @@ static void handle_event(const std::string &line, ToolResult &r) {
     else if (kind == "skip") { r.skipped = true; r.skip = rest; }
     else if (kind == "error") r.error = rest;
     else if (kind == "check") r.check = rest;
+    else if (kind == "extracted") r.extracted = rest;
+    else if (kind == "version") r.version = rest;  // (Trirod-Launcher.exe --version: the self-update's check)
     else if (kind == "done") r.done = true;
 }
 
@@ -663,8 +666,10 @@ struct Release {
     std::string why;                 // check failed / no update source
     std::string tag, version, notes_url;
     bool newer = false, required = false;
+    bool new_launcher = false;       // min_launcher is newer than this launcher: the update replaces it (it always does)
     std::string gamelib_id, gamebuild_id;
     std::string asset_name, asset_url, asset_sha256;
+    std::string local_file;          // --update-from: the package is this file, not a download
     uint64_t asset_size = 0;
 };
 static Release g_release;
@@ -672,6 +677,46 @@ static std::atomic<bool> g_checking{false};
 
 static bool asset_url_ok(const std::string &url, const std::string &repo) {
     return url.rfind("https://github.com/" + repo + "/releases/download/", 0) == 0;
+}
+
+// The manifest's own fields (both sources): version, build identifiers, the tools package, and how the release
+// relates to what is installed. false = not installable here (rel.why).
+static bool release_fields(const Json &j, const ToolsInfo &tools, Release &rel) {
+    if (j["format"].str() != "trirod-release" || (int)j["schema"].num() != 1) {
+        rel.why = RELEASE_MANIFEST " of " + rel.tag + " is not a schema-1 Trirod release manifest";
+        return false;
+    }
+    if (j["channel"].str() != RELEASE_CHANNEL) { rel.why = "the latest release is not for " RELEASE_CHANNEL; return false; }
+    rel.version = j["version"].str();
+    rel.gamelib_id = j["build"]["gamelib_id"].str();
+    rel.gamebuild_id = j["build"]["gamebuild_id"].str();
+    // min_launcher: the launcher this release's tools need. The update installs the package's own launcher and restarts
+    // into it, so an older launcher here is replaced, not a reason to refuse (that refusal is what kept every release
+    // whose min_launcher was its own version, make_release.ps1's default, from ever being installed). min_updater: the
+    // oldest launcher whose self-update can install this package (empty: any that has one); older ones can't.
+    std::string min_launcher = j["min_launcher"].str(), min_updater = j["min_updater"].str();
+    rel.new_launcher = !min_launcher.empty() && version_compare(TRIROD_VERSION, min_launcher) == -1;
+    if (!min_updater.empty() && version_compare(TRIROD_VERSION, min_updater) == -1) {
+        rel.why = "release " + rel.version + " can only be installed by launcher " + min_updater + " or newer: download it from " +
+                  rel.notes_url;
+        return false;
+    }
+    for (auto &a : j["assets"].a) {
+        if (a["kind"].str() != "tools") continue;
+        rel.asset_name = a["name"].str();
+        rel.asset_sha256 = a["sha256"].str();
+        rel.asset_size = (uint64_t)a["size"].num();
+    }
+    if (rel.asset_name.empty() || rel.asset_sha256.size() != 64 || !rel.asset_size) {
+        rel.why = RELEASE_MANIFEST " of " + rel.tag + " names no tools package (name, size and SHA-256)";
+        return false;
+    }
+    int cmp = tools.present ? version_compare(rel.version, tools.version) : 1;
+    rel.newer = cmp == 1;
+    // (a new release recompiles only when its tools make other game code or another runtime than the build here)
+    rel.required = rel.newer && (!tools.present || rel.gamelib_id != tools.gamelib_id || rel.gamebuild_id != tools.gamebuild_id ||
+                                 (j["required"].kind == Json::Bool && j["required"].b));
+    return true;
 }
 
 static Release check_release(const ToolsInfo &tools) {
@@ -699,27 +744,10 @@ static Release check_release(const ToolsInfo &tools) {
     if (manifest_url.empty()) { rel.why = "release " + rel.tag + " has no " RELEASE_MANIFEST; return rel; }
     if (!asset_url_ok(manifest_url, repo)) { rel.why = "unexpected manifest location " + manifest_url; return rel; }
     if (!http_text(manifest_url, body, why)) { rel.why = why; return rel; }
-    if (!json_parse(body, j) || j["format"].str() != "trirod-release" || (int)j["schema"].num() != 1) {
-        rel.why = RELEASE_MANIFEST " of " + rel.tag + " is not a schema-1 Trirod release manifest";
-        return rel;
-    }
-    if (j["channel"].str() != RELEASE_CHANNEL) { rel.why = "the latest release is not for " RELEASE_CHANNEL; return rel; }
-    rel.version = j["version"].str();
-    rel.gamelib_id = j["build"]["gamelib_id"].str();
-    rel.gamebuild_id = j["build"]["gamebuild_id"].str();
-    std::string min_launcher = j["min_launcher"].str();
-    if (!min_launcher.empty() && version_compare(TRIROD_VERSION, min_launcher) == -1) {
-        rel.why = "release " + rel.version + " needs a newer launcher (" + min_launcher + "): download it from " + rel.notes_url;
-        return rel;
-    }
-    for (auto &a : j["assets"].a) {
-        if (a["kind"].str() != "tools") continue;
-        rel.asset_name = a["name"].str();
-        rel.asset_sha256 = a["sha256"].str();
-        rel.asset_size = (uint64_t)a["size"].num();
-    }
+    if (!json_parse(body, j)) { rel.why = RELEASE_MANIFEST " of " + rel.tag + " could not be read"; return rel; }
+    if (!release_fields(j, tools, rel)) return rel;
     auto it = assets.find(rel.asset_name);
-    if (rel.asset_name.empty() || rel.asset_sha256.size() != 64 || it == assets.end()) {
+    if (it == assets.end()) {
         rel.why = RELEASE_MANIFEST " names no tools package attached to release " + rel.tag;
         return rel;
     }
@@ -730,11 +758,27 @@ static Release check_release(const ToolsInfo &tools) {
         return rel;
     }
     rel.ok = true;
-    int cmp = tools.present ? version_compare(rel.version, tools.version) : 1;
-    rel.newer = cmp == 1;
-    // (a new release recompiles only when its tools make other game code or another runtime than the build here)
-    rel.required = rel.newer && (!tools.present || rel.gamelib_id != tools.gamelib_id || rel.gamebuild_id != tools.gamebuild_id ||
-                                 j["required"].kind == Json::Bool && j["required"].b);
+    return rel;
+}
+
+// --update-from <folder>: a release kept on disk (its trirod-release.json and the zip it names), for testing the
+// update and installing without GitHub. The package is checked against the manifest exactly as a download is.
+static Release check_release_local(const std::string &folder, const ToolsInfo &tools) {
+    Release rel;
+    rel.checked = true;
+    rel.notes_url = folder;
+    Json j;
+    if (!json_parse(read_file(folder + "\\" RELEASE_MANIFEST), j) || j.kind != Json::Obj) {
+        rel.why = "no readable " RELEASE_MANIFEST " in " + folder;
+        return rel;
+    }
+    rel.tag = j["version"].str();
+    if (!release_fields(j, tools, rel)) return rel;
+    if (rel.asset_name.find_first_of("\\/:") != std::string::npos) { rel.why = "the manifest's package name is not a file name"; return rel; }
+    rel.local_file = folder + "\\" + rel.asset_name;
+    rel.asset_url = rel.local_file;
+    if (!file_exists(rel.local_file)) { rel.why = "the package " + rel.local_file + " is missing"; return rel; }
+    rel.ok = true;
     return rel;
 }
 
@@ -767,46 +811,117 @@ static bool remove_tree(const std::string &p) {
     return RemoveDirectoryW(widen(p).c_str()) != 0;
 }
 
-// Download, verify, unpack and install the release's tools package. The installed tools are moved aside first and
-// put back if anything fails, so a failed update leaves the working installation as it was.
-static bool apply_update(const Release &rel, std::string &why) {
+// ================================================================== self-update
+// A tools package carries the launcher too, and Windows can't replace an executable while it runs. (It can rename
+// one: the swap here used to move the running Trirod-Launcher.exe aside and the new one in, after which this process
+// kept running the old code and DLLs into the recompile, and the new launcher only took over at the next manual
+// start.) So the NEW launcher installs the update, from its unpacked stage folder, once this one has closed:
+//   1. stage_update (this launcher): download (or --update-from copy), size and SHA-256 against the manifest, unpack
+//      into updates\<version>\stage, check the contents, run the staged launcher's --version, write update.json.
+//   2. hand_off_update: start stage\Trirod-Launcher.exe --apply-update <dir> --wait-pid <this pid> and wait for its
+//      "Staged" signal; then this launcher closes. No signal: it stays open and nothing installed was touched.
+//   3. apply_mode (the staged launcher): wait for this process to end, move each installed top-level entry aside into
+//      updates\<version>\previous and the package's in, start the installed (new) launcher with the same --data /
+//      --dev / --console plus --updated <version> (and --recompile when the release needs it), wait for its "Started"
+//      signal. A failed move, start or signal moves everything back and starts the previous launcher with
+//      --update-error <why>. The steps are logged in updates\<version>\apply.log.
+static const char *const PACKAGE_REQUIRED[] = {"Trirod-Launcher.exe", "trbuild.exe", "Trirod-ShaderPrep.exe", "SDL3.dll",
+                                               "tools\\trirod-tools.json"};
+static std::atomic<bool> g_quit_for_update{false};  // the staged launcher took over: close this one
+
+static std::string signal_name(const char *what, DWORD pid) {
+    return std::string("Local\\Trirod-Launcher-") + what + "-" + std::to_string(pid);
+}
+// Tell whoever started this process (it created the event under our pid) that a phase is reached
+static void signal_parent(const char *what) {
+    HANDLE e = OpenEventW(EVENT_MODIFY_STATE, FALSE, widen(signal_name(what, GetCurrentProcessId())).c_str());
+    if (e) SetEvent(e), CloseHandle(e);
+}
+
+// Start argv suspended, create its named event, let it run, and wait for the event, its exit, or the timeout.
+// true = signaled (the process keeps running; *pid says which). false: why (and the process is ended).
+static bool start_and_wait_signal(const std::vector<std::string> &argv, const std::string &cwd, const char *what,
+                                  DWORD timeout_ms, DWORD *pid, std::string &why) {
+    std::wstring cmd;
+    for (size_t i = 0; i < argv.size(); i++) cmd += (i ? L" " : L"") + quote_arg(argv[i]);
+    STARTUPINFOW si = {};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(widen(argv[0]).c_str(), cmd.data(), NULL, NULL, FALSE, CREATE_SUSPENDED, NULL,
+                        widen(cwd).c_str(), &si, &pi)) {
+        why = argv[0] + " could not start: " + win_error(GetLastError());
+        return false;
+    }
+    HANDLE ev = CreateEventW(NULL, TRUE, FALSE, widen(signal_name(what, pi.dwProcessId)).c_str());
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    HANDLE waits[2] = {ev, pi.hProcess};
+    DWORD w = ev ? WaitForMultipleObjects(2, waits, FALSE, timeout_ms) : WAIT_FAILED;
+    bool ok = w == WAIT_OBJECT_0;
+    if (!ok) {
+        DWORD code = 0;
+        if (w == WAIT_OBJECT_0 + 1 && GetExitCodeProcess(pi.hProcess, &code))
+            why = argv[0] + " ended at start (exit status " + std::to_string(code) + ")";
+        else why = argv[0] + " did not answer within " + std::to_string(timeout_ms / 1000) + " s";
+        TerminateProcess(pi.hProcess, 1);
+    }
+    if (pid) *pid = pi.dwProcessId;
+    if (ev) CloseHandle(ev);
+    CloseHandle(pi.hProcess);
+    return ok;
+}
+
+// 1. Download / copy, verify, unpack and check the package; write update.json for the staged launcher.
+static bool stage_update(const Release &rel, std::string &why) {
     Step *st;
     {
         std::lock_guard<std::mutex> l(g_mu);
         st = step("update");
         st->state = StepState::Running;
-        st->text = "Downloading " + rel.asset_name;
+        st->text = (rel.local_file.empty() ? "Downloading " : "Reading ") + rel.asset_name;
         st->tool = rel.asset_url;
     }
     std::string dir = g_paths.install + "\\updates\\" + rel.version;
-    remove_tree(dir);
+    if (!remove_tree(dir)) { why = "could not clear " + dir + " (is a launcher from it still running?)"; return false; }
     CreateDirectoryW(widen(g_paths.install + "\\updates").c_str(), NULL);
     CreateDirectoryW(widen(dir).c_str(), NULL);
     std::string zip = dir + "\\" + rel.asset_name, part = zip + ".part";
-    log_line(3, "downloading " + rel.asset_url + " (" + std::to_string(rel.asset_size) + " bytes)");
+    log_line(3, (rel.local_file.empty() ? "downloading " : "reading ") + rel.asset_url + " (" + std::to_string(rel.asset_size) + " bytes)");
     FILE *f = _wfopen(widen(part).c_str(), L"wb");
     if (!f) { why = "could not write " + part; return false; }
     Sha256 sha;
     uint64_t got = 0, length = 0;
-    bool ok = http_get(rel.asset_url, [&](const char *d, size_t n) {
+    auto sink = [&](const char *d, size_t n) {
         if (g_cancel || fwrite(d, 1, n, f) != n) return false;
         sha.add(d, n);
         got += n;
         std::lock_guard<std::mutex> l(g_mu);
         uint64_t total = rel.asset_size ? rel.asset_size : length;
-        st->progress = total ? 0.8 * (double)got / (double)total : 0;
-        char t[128];
-        snprintf(t, sizeof t, "Downloading %s: %.1f of %.1f MB", rel.asset_name.c_str(), got / 1048576.0, total / 1048576.0);
+        st->progress = total ? 0.7 * (double)got / (double)total : 0;
+        char t[160];
+        snprintf(t, sizeof t, "%s %s: %.1f of %.1f MB", rel.local_file.empty() ? "Downloading" : "Reading",
+                 rel.asset_name.c_str(), got / 1048576.0, total / 1048576.0);
         st->text = t;
         return true;
-    }, &length, why);
+    };
+    bool ok;
+    if (rel.local_file.empty()) ok = http_get(rel.asset_url, sink, &length, why);
+    else {
+        FILE *in = _wfopen(widen(rel.local_file).c_str(), L"rb");
+        ok = in != NULL;
+        if (!in) why = "could not read " + rel.local_file;
+        static char buf[1 << 20];
+        size_t n;
+        while (ok && in && (n = fread(buf, 1, sizeof buf, in)) > 0) ok = sink(buf, n);
+        if (in) fclose(in);
+    }
     if (fclose(f) != 0) ok = false;
-    if (!ok) { DeleteFileW(widen(part).c_str()); return false; }
+    if (!ok) { DeleteFileW(widen(part).c_str()); if (why.empty()) why = g_cancel ? "cancelled" : "could not save the package"; return false; }
     std::string digest = sha.hex();
     if (got != rel.asset_size || _stricmp(digest.c_str(), rel.asset_sha256.c_str())) {
         DeleteFileW(widen(part).c_str());
-        why = "the downloaded package failed verification (size " + std::to_string(got) + ", SHA-256 " + digest +
-              "; expected " + std::to_string(rel.asset_size) + ", " + rel.asset_sha256 + ")";
+        why = "the package failed verification (size " + std::to_string(got) + ", SHA-256 " + digest + "; expected " +
+              std::to_string(rel.asset_size) + ", " + rel.asset_sha256 + ")";
         return false;
     }
     MoveFileExW(widen(part).c_str(), widen(zip).c_str(), MOVEFILE_REPLACE_EXISTING);
@@ -819,60 +934,168 @@ static bool apply_update(const Release &rel, std::string &why) {
     GetSystemDirectoryW(sys, MAX_PATH);
     {
         std::lock_guard<std::mutex> l(g_mu);
-        st->progress = 0.82;
+        st->progress = 0.75;
         st->text = "Unpacking the tools";
     }
     ToolResult t = run_tool("tar", {narrow(sys) + "\\tar.exe", "-xf", zip, "-C", stage}, dir);
     if (t.exit != 0) { why = "the package could not be unpacked (tar exit " + std::to_string(t.exit) + ")"; return false; }
+    DeleteFileW(widen(zip).c_str());
     Json tj;
     if (!json_parse(read_file(stage + "\\tools\\trirod-tools.json"), tj) || tj["version"].str() != rel.version) {
         why = "the package's tools/trirod-tools.json does not say version " + rel.version;
         return false;
     }
-    std::vector<std::string> names = list_dir(stage);
-    for (auto &n : names)
+    for (auto &n : list_dir(stage))
         if (protected_name(n)) { why = "the package contains '" + n + "', which belongs to the player's data: refused"; return false; }
-
-    // swap: each top-level entry moved aside, the new one moved in; on failure everything moved back
+    for (const char *n : PACKAGE_REQUIRED)
+        if (!file_exists(stage + "\\" + n)) { why = std::string("the package has no ") + n; return false; }
+    // The staged launcher must start and be this release's (it is what installs the rest and what runs afterwards)
     {
         std::lock_guard<std::mutex> l(g_mu);
-        st->progress = 0.9;
-        st->text = "Installing the tools";
+        st->progress = 0.85;
+        st->text = "Checking the new launcher";
     }
-    std::string backup = dir + "\\previous";
-    CreateDirectoryW(widen(backup).c_str(), NULL);
-    std::vector<std::string> moved_old, moved_new;
-    ok = true;
+    ToolResult v = run_tool("new launcher", {stage + "\\Trirod-Launcher.exe", "--version"}, stage);
+    if (v.exit != 0 || v.version != rel.version) {
+        why = "the package's launcher " + (v.exit != 0 ? "does not start (" + (v.error.empty() ? "exit " + std::to_string(v.exit) : v.error) + ")"
+                                                         : "reports version " + v.version + ", not " + rel.version);
+        return false;
+    }
+    std::string s = "{\n  \"format\": \"trirod-update\",\n  \"schema\": 1,\n";
+    s += "  \"version\": " + json_quote(rel.version) + ",\n";
+    s += "  \"install\": " + json_quote(g_paths.install) + ",\n";
+    s += "  \"data\": " + json_quote(g_paths.data) + ",\n";
+    s += "  \"dev\": " + std::string(g_dev ? "true" : "false") + ",\n";
+    s += "  \"console\": " + std::string(g_console ? "true" : "false") + ",\n";
+    s += "  \"recompile\": " + std::string(rel.required ? "true" : "false") + ",\n";
+    s += "  \"from_launcher\": " + json_quote(TRIROD_VERSION) + "\n}\n";
+    if (!write_file(dir + "\\update.json", s)) { why = "could not write " + dir + "\\update.json"; return false; }
+    return true;
+}
+
+// 2. Start the staged launcher in apply mode; true once it has taken over (this launcher must then close)
+static bool hand_off_update(const Release &rel, std::string &why) {
+    std::string dir = g_paths.install + "\\updates\\" + rel.version, stage = dir + "\\stage";
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        Step *st = step("update");
+        st->progress = 0.95;
+        st->text = "Starting the new launcher to install the update";
+    }
+    log_line(3, "handing the update to " + stage + "\\Trirod-Launcher.exe");
+    if (!start_and_wait_signal({stage + "\\Trirod-Launcher.exe", "--apply-update", dir, "--wait-pid",
+                                std::to_string(GetCurrentProcessId())},
+                               stage, "Staged", 30000, NULL, why))
+        return false;
+    log_line(3, "the new launcher took over: closing; it installs " + rel.version + " and starts it");
+    return true;
+}
+
+// ---- 3. apply mode (the staged launcher, no window)
+static FILE *g_apply_log;
+static void apply_log(const std::string &t) {
+    if (g_apply_log) fprintf(g_apply_log, "%s %s\n", now_iso().c_str(), t.c_str()), fflush(g_apply_log);
+}
+
+// Move the stage's top-level entries into install, the installed ones aside first; false = everything moved back
+static bool swap_into(const std::string &stage, const std::string &install, const std::string &backup,
+                      const std::vector<std::string> &names, std::vector<std::string> &moved_old,
+                      std::vector<std::string> &moved_new, std::string &why) {
     for (auto &n : names) {
-        std::string cur = g_paths.install + "\\" + n, old = backup + "\\" + n;
+        std::string cur = install + "\\" + n, old = backup + "\\" + n;
         if (path_exists(cur)) {
             if (!MoveFileExW(widen(cur).c_str(), widen(old).c_str(), 0)) {
-                why = "could not move " + cur + " aside: " + win_error(GetLastError()) + " (close the game and try again)";
-                ok = false;
-                break;
+                why = "could not move " + cur + " aside: " + win_error(GetLastError()) + " (is the game or a tool still running?)";
+                return false;
             }
             moved_old.push_back(n);
         }
         if (!MoveFileExW(widen(stage + "\\" + n).c_str(), widen(cur).c_str(), 0)) {
             why = "could not install " + cur + ": " + win_error(GetLastError());
-            ok = false;
-            break;
+            return false;
         }
         moved_new.push_back(n);
     }
-    if (!ok) {
-        for (auto &n : moved_new) MoveFileExW(widen(g_paths.install + "\\" + n).c_str(), widen(stage + "\\" + n).c_str(), 0);
-        for (auto &n : moved_old) MoveFileExW(widen(backup + "\\" + n).c_str(), widen(g_paths.install + "\\" + n).c_str(), 0);
-        log_line(2, "update rolled back: the previous tools are in place");
-        return false;
-    }
-    DeleteFileW(widen(zip).c_str());
-    log_line(3, "installed tools " + rel.version + " (the previous files are in " + backup + " until the next update)");
-    std::lock_guard<std::mutex> l(g_mu);
-    st->state = StepState::Done;
-    st->progress = 1;
-    st->text = "Tools " + rel.version + " installed";
     return true;
+}
+static void swap_back(const std::string &stage, const std::string &install, const std::string &backup,
+                      const std::vector<std::string> &moved_old, const std::vector<std::string> &moved_new) {
+    for (auto &n : moved_new)
+        if (!MoveFileExW(widen(install + "\\" + n).c_str(), widen(stage + "\\" + n).c_str(), 0))
+            apply_log("rollback: could not move " + n + " back to the stage: " + win_error(GetLastError()));
+    for (auto &n : moved_old)
+        if (!MoveFileExW(widen(backup + "\\" + n).c_str(), widen(install + "\\" + n).c_str(), 0))
+            apply_log("rollback: could not restore " + n + ": " + win_error(GetLastError()));
+}
+
+static std::vector<std::string> relaunch_args(const std::string &install, const Json &u) {
+    std::vector<std::string> a = {install + "\\Trirod-Launcher.exe", "--data", u["data"].str()};
+    if (u["dev"].kind == Json::Bool && u["dev"].b) a.push_back("--dev");
+    if (u["console"].kind == Json::Bool && u["console"].b) a.push_back("--console");
+    return a;
+}
+
+static int apply_fail(const std::string &msg) {
+    apply_log("FAILED: " + msg);
+    MessageBoxW(NULL, widen("The Trirod update could not be installed:\n\n" + msg).c_str(), L"Trirod Launcher", MB_ICONERROR);
+    return 1;
+}
+
+static int apply_mode(const std::string &dir_arg, DWORD wait_pid) {
+    std::string dir = full_path(dir_arg), stage = dir + "\\stage", backup = dir + "\\previous";
+    g_apply_log = _wfopen(widen(dir + "\\apply.log").c_str(), L"ab");
+    apply_log(std::string("Trirod-Launcher ") + TRIROD_VERSION + " applying the update in " + dir);
+    Json u;
+    if (!json_parse(read_file(dir + "\\update.json"), u) || u["format"].str() != "trirod-update" ||
+        u["version"].str() != TRIROD_VERSION || u["install"].str().empty() || u["data"].str().empty())
+        return apply_fail(dir + "\\update.json is missing or is not this launcher's update");
+    std::string install = u["install"].str();
+    // (this executable must be the staged one: it moves its own folder's entries into the installation)
+    if (_stricmp(full_path(exe_dir()).c_str(), full_path(stage).c_str()))
+        return apply_fail("--apply-update runs only from the update's stage folder (" + stage + ")");
+    // The previous launcher closes once it sees this signal; wait for it to be gone before touching its files
+    HANDLE old = wait_pid ? OpenProcess(SYNCHRONIZE, FALSE, wait_pid) : NULL;
+    signal_parent("Staged");
+    if (old) {
+        DWORD w = WaitForSingleObject(old, 60000);
+        CloseHandle(old);
+        if (w != WAIT_OBJECT_0) return apply_fail("the previous launcher did not close within 60 s; nothing was changed");
+    }
+    apply_log("the previous launcher has closed");
+    std::vector<std::string> names = list_dir(stage), moved_old, moved_new;
+    for (auto &n : names)
+        if (protected_name(n)) return apply_fail("the package contains '" + n + "', which belongs to the player's data");
+    remove_tree(backup);
+    CreateDirectoryW(widen(backup).c_str(), NULL);
+    std::string why;
+    bool ok = swap_into(stage, install, backup, names, moved_old, moved_new, why);
+    if (ok) {
+        apply_log("installed " + std::to_string(moved_new.size()) + " entries (" + std::to_string(moved_old.size()) +
+                  " previous ones kept in " + backup + ")");
+        std::vector<std::string> a = relaunch_args(install, u);
+        a.insert(a.end(), {"--updated", u["version"].str()});
+        if (u["recompile"].kind == Json::Bool && u["recompile"].b) a.push_back("--recompile");
+        DWORD pid = 0;
+        ok = start_and_wait_signal(a, install, "Started", 60000, &pid, why);
+        if (ok) {
+            apply_log("the new launcher " + std::to_string(pid) + " is running: update complete");
+            // older updates' folders (their previous files) are no longer the way back: keep only this one
+            for (auto &n : list_dir(install + "\\updates"))
+                if (_stricmp(n.c_str(), u["version"].str().c_str())) remove_tree(install + "\\updates\\" + n);
+            return 0;
+        }
+        why = "the new launcher " + why;
+    }
+    apply_log("installing failed: " + why + "; restoring the previous installation");
+    swap_back(stage, install, backup, moved_old, moved_new);
+    std::vector<std::string> a = relaunch_args(install, u);
+    a.insert(a.end(), {"--update-error", why});
+    std::string why2;
+    if (!start_and_wait_signal(a, install, "Started", 60000, NULL, why2))
+        return apply_fail(why + "\n\nThe previous installation was restored, but its launcher could not be started (" + why2 +
+                          "): start Trirod-Launcher.exe yourself.");
+    apply_log("the previous launcher is running again");
+    return 1;
 }
 
 // ================================================================== the build workflow (worker thread)
@@ -953,15 +1176,20 @@ static void workflow(bool update_first, Release rel) {
     open_build_log();
     std::string why;
     if (update_first) {
+        // The new launcher installs the package and restarts into it (with --recompile when the release needs it):
+        // this one stops here and closes. Nothing installed changes before that hand-off succeeds.
         set_status("Updating the tools");
-        if (!apply_update(rel, why)) {
+        if (!stage_update(rel, why) || !hand_off_update(rel, why)) {
             fail_running("Update failed: " + why);
-            log_line(2, "update failed: " + why);
+            log_line(2, "update failed: " + why + " (the installed version was not changed)");
             set_status(build_state(read_tools()).empty() ? "Update failed: the installed version still works"
                                                           : "Update failed");
             g_busy = false;
             return;
         }
+        set_status("Restarting into Trirod " + version_label(rel.version));
+        g_quit_for_update = true;
+        return;  // (g_busy stays set: nothing else may start before the window closes)
     }
     ToolsInfo tools = read_tools();
     if (!tools.present) {
@@ -971,10 +1199,11 @@ static void workflow(bool update_first, Release rel) {
         return;
     }
     log_line(3, "tools " + tools.version + ": game code id " + tools.gamelib_id + ", runtime id " + tools.gamebuild_id);
-    std::string source = g_config["source"];
+    std::string source = g_config["source"], update = g_config["update"];
     struct Run { const char *label; std::vector<std::string> argv; };
     std::vector<std::string> files = {g_paths.trbuild(), "files", "--data", g_paths.data};
     if (!source.empty()) files.insert(files.end(), {"--source", source});
+    if (!source.empty() && !update.empty()) files.insert(files.end(), {"--update", update});
     Run runs[] = {
         {"trbuild files", files},
         {"trbuild code", {g_paths.trbuild(), "code", "--data", g_paths.data}},
@@ -1009,38 +1238,53 @@ static void workflow(bool update_first, Release rel) {
     g_busy = false;
 }
 
-// trbuild check (worker thread): is the chosen source usable?
-struct Validation { bool running = false, done = false, ok = false; std::string text, for_source; };
+// trbuild check (worker thread): is the chosen source usable, what is it (base / update by content), and is what is
+// already extracted current for it? ("@@extracted <none|current|stale|incomplete> <text>", docs/TOOL-PROTOCOL.md)
+struct Validation {
+    bool running = false, done = false, ok = false;
+    std::string text, for_source, for_update;
+    std::string extracted, extracted_text;  // the extraction's state for this selection, and why
+};
 static Validation g_valid;
-static void validate(std::string source) {
-    ToolResult r = run_tool("trbuild check", source.empty() ? std::vector<std::string>{g_paths.trbuild(), "check", "--data", g_paths.data}
-                                                            : std::vector<std::string>{g_paths.trbuild(), "check", "--data", g_paths.data, "--source", source},
-                            g_paths.data);
+static void validate(std::string source, std::string update) {
+    std::vector<std::string> argv = {g_paths.trbuild(), "check", "--data", g_paths.data};
+    if (!source.empty()) argv.insert(argv.end(), {"--source", source});
+    if (!source.empty() && !update.empty()) argv.insert(argv.end(), {"--update", update});
+    ToolResult r = run_tool("trbuild check", argv, g_paths.data);
     std::lock_guard<std::mutex> l(g_mu);
     g_valid.running = false;
     g_valid.done = true;
     g_valid.for_source = source;
+    g_valid.for_update = update;
     g_valid.ok = r.check.rfind("ok ", 0) == 0;
     g_valid.text = r.check.size() > 3 ? r.check.substr(r.check.find(' ') + 1) : r.error.empty() ? "the game files could not be checked" : r.error;
+    size_t sp = r.extracted.find(' ');
+    g_valid.extracted = r.extracted.substr(0, sp);
+    g_valid.extracted_text = sp == std::string::npos ? "" : r.extracted.substr(sp + 1);
 }
 
 // ================================================================== actions
-static void start_validation(const std::string &source) {
+static void start_validation(const std::string &source, const std::string &update) {
     {
         std::lock_guard<std::mutex> l(g_mu);
         if (g_valid.running) return;
         g_valid = Validation();
         g_valid.running = true;
     }
-    std::thread(validate, source).detach();
+    std::thread(validate, source, update).detach();
 }
 
-static std::string g_picked;  // from the file dialogs (any thread)
+static std::string g_picked, g_picked_update;  // from the file dialogs (any thread)
 static std::mutex g_pick_mu;
 static void SDLCALL picked(void *, const char *const *files, int) {
     if (!files || !files[0]) return;
     std::lock_guard<std::mutex> l(g_pick_mu);
     g_picked = files[0];
+}
+static void SDLCALL picked_update(void *, const char *const *files, int) {
+    if (!files || !files[0]) return;
+    std::lock_guard<std::mutex> l(g_pick_mu);
+    g_picked_update = files[0];
 }
 
 static void start_workflow(bool update_first) {
@@ -1165,18 +1409,58 @@ static std::string shader_summary() {
     return b;
 }
 
+// One launcher per installation and data folder: two would install updates and run builds over each other. The
+// self-update's restarted launcher waits for the closing one's lock (it is gone once that process has ended).
+static HANDLE g_instance;
+static bool single_instance(DWORD wait_ms) {
+    std::string key = g_paths.install + "|" + g_paths.data;
+    uint64_t h = 1469598103934665603ull;
+    for (char c : key) h = (h ^ (uint8_t)tolower((unsigned char)(c == '/' ? '\\' : c))) * 1099511628211ull;
+    char name[64];
+    snprintf(name, sizeof name, "Local\\Trirod-Launcher-%016llx", (unsigned long long)h);
+    g_instance = CreateMutexA(NULL, FALSE, name);
+    if (!g_instance) return true;  // (no lock to take: don't refuse to start over it)
+    DWORD w = WaitForSingleObject(g_instance, wait_ms);
+    return w == WAIT_OBJECT_0 || w == WAIT_ABANDONED;
+}
+
 int main(int argc, char **argv) {
     g_paths.install = exe_dir();
     g_paths.data = g_paths.install;
     bool auto_recompile = false;  // --recompile: start Recompile as soon as the game files are checked
     bool auto_shaders = false;    // --prepare-shaders: start "Prepare shaders" once the built game is found
+    bool auto_update = false;     // --update: start the update as soon as the check finds a newer release (tests)
+    std::string apply_dir, updated, update_error, update_from;
+    DWORD wait_pid = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--dev")) g_dev = true;
         else if (!strcmp(argv[i], "--recompile")) auto_recompile = true;
         else if (!strcmp(argv[i], "--prepare-shaders")) auto_shaders = true;
         else if (!strcmp(argv[i], "--console")) g_console = true;
+        else if (!strcmp(argv[i], "--update")) auto_update = true;
         else if (!strcmp(argv[i], "--data") && i + 1 < argc) g_paths.data = full_path(argv[++i]);
+        else if (!strcmp(argv[i], "--update-from") && i + 1 < argc) update_from = full_path(argv[++i]);
+        // the self-update (stage_update / apply_mode): internal arguments
+        else if (!strcmp(argv[i], "--apply-update") && i + 1 < argc) apply_dir = argv[++i];
+        else if (!strcmp(argv[i], "--wait-pid") && i + 1 < argc) wait_pid = (DWORD)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--updated") && i + 1 < argc) updated = argv[++i];
+        else if (!strcmp(argv[i], "--update-error") && i + 1 < argc) update_error = argv[++i];
+        else if (!strcmp(argv[i], "--version")) {  // (an event line: the self-update reads it through run_tool)
+            std::string line = std::string("@@version ") + TRIROD_VERSION + "\n";
+            DWORD n;
+            WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line.data(), (DWORD)line.size(), &n, NULL);
+            return 0;
+        }
     }
+    if (!apply_dir.empty()) return apply_mode(apply_dir, wait_pid);
+    if (!single_instance(updated.empty() && update_error.empty() ? 0 : 15000)) {
+        MessageBoxW(NULL, widen("Trirod Launcher is already running for " + g_paths.data + ".").c_str(), L"Trirod Launcher",
+                    MB_ICONINFORMATION);
+        return 0;
+    }
+    if (!updated.empty()) g_notice = "Updated to Trirod " + version_label(updated) + ".";
+    if (!update_error.empty()) g_error = "The update could not be installed: " + update_error +
+                                         ". The previous version was restored and still works.";
     {   // (as runtime/platform/windows.c: the console it was started from, or a new one; a redirected stderr stays)
         const char *e = getenv("EOWRECOMP_CONSOLE");
         if (e && *e && strcmp(e, "0")) g_console = true;
@@ -1237,11 +1521,11 @@ int main(int argc, char **argv) {
     ToolsInfo tools = read_tools();
     Uint64 tools_read_at = SDL_GetTicks();
     if (tools.present && (!g_config["source"].empty() || file_exists(g_paths.extracted() + "\\exefs\\main")))
-        start_validation(g_config["source"]);
-    if (!g_dev) {
+        start_validation(g_config["source"], g_config["update"]);
+    if (!g_dev || !update_from.empty()) {  // (--update-from: a release on disk, also in development mode)
         g_checking = true;
-        std::thread([tools] {
-            Release r = check_release(tools);
+        std::thread([tools, update_from] {
+            Release r = update_from.empty() ? check_release(tools) : check_release_local(update_from, tools);
             std::lock_guard<std::mutex> l(g_mu);
             g_release = r;
             g_checking = false;
@@ -1258,11 +1542,12 @@ int main(int argc, char **argv) {
         if (SDL_GetWindowFlags(win) & SDL_WINDOW_MINIMIZED) { SDL_Delay(50); continue; }
         {
             std::lock_guard<std::mutex> l(g_pick_mu);
-            if (!g_picked.empty()) {
-                g_config["source"] = g_picked;
+            if (!g_picked.empty() || !g_picked_update.empty()) {
+                if (!g_picked.empty()) g_config["source"] = g_picked;
+                if (!g_picked_update.empty()) g_config["update"] = g_picked_update;
                 config_save();
-                g_picked.clear();
-                start_validation(g_config["source"]);
+                g_picked.clear(), g_picked_update.clear();
+                start_validation(g_config["source"], g_config["update"]);
             }
         }
         // snapshot of the shared state for this frame
@@ -1306,41 +1591,85 @@ int main(int argc, char **argv) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s  %s", version_label(tools.present ? tools.version : TRIROD_VERSION).c_str(),
                             g_dev ? "| Development mode" : "");
-        ImGui::TextDisabled("Fan project, not affiliated with Nintendo. Needs your own legally obtained copy of the game, v1.0.0.");
+        ImGui::TextDisabled("Fan project, not affiliated with Nintendo. Needs your own legally obtained copy of the game (v1.0.0, or v1.1.0 with its update).");
         ImGui::Separator();
 
         // ---- updates
-        if (g_dev) ImGui::TextColored(ImVec4(0.55f, 0.78f, 1, 1), "Development mode: no update check or download; tools from %s",
-                                      g_paths.install.c_str());
+        if (g_dev && update_from.empty())
+            ImGui::TextColored(ImVec4(0.55f, 0.78f, 1, 1), "Development mode: no update check or download; tools from %s",
+                               g_paths.install.c_str());
         else if (g_checking) ImGui::TextDisabled("Checking for updates...");
         else if (!rel.ok) ImGui::TextDisabled("Updates: %s", rel.why.c_str());
-        else if (rel.newer) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Update available: %s%s", version_label(rel.version).c_str(),
+        else if (rel.newer) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Update available: %s%s%s%s", version_label(rel.version).c_str(),
+                                               rel.local_file.empty() ? "" : " (from a local folder)",
+                                               rel.new_launcher ? " (includes a new launcher: it restarts)" : "",
                                                rel.required ? " (the game will be recompiled)" : "");
         else ImGui::TextDisabled("Up to date (%s)", version_label(rel.version).c_str());
+        if (!g_notice.empty()) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "%s", g_notice.c_str());
         if (!tools.present) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "Build tools missing: %s", tools.why.c_str());
 
         // ---- game files
         ImGui::Spacing();
         ImGui::Text("Your game files");
-        std::string src = g_config["source"];
+        std::string src = g_config["source"], upd = g_config["update"];
         ImGui::TextDisabled("%s", src.empty() ? (have_files ? "(already prepared in the data folder)" : "Not chosen yet")
                                               : src.c_str());
+        if (!upd.empty()) ImGui::TextDisabled("Update: %s", upd.c_str());
+        // (what the check found applies to this selection only; a new pick starts a new check)
+        bool val_current = val.done && val.for_source == src && val.for_update == upd;
         if (val.running) ImGui::TextDisabled("Checking...");
-        else if (val.done) ImGui::TextColored(val.ok ? ImVec4(0.45f, 0.85f, 0.55f, 1) : ImVec4(1, 0.45f, 0.4f, 1), "%s",
-                                              val.text.c_str());
+        else if (val_current) {
+            ImGui::TextColored(val.ok ? ImVec4(0.45f, 0.85f, 0.55f, 1) : ImVec4(1, 0.45f, 0.4f, 1), "%s%s",
+                               val.ok && !src.empty() ? "Detected: " : "", val.text.c_str());
+            if (val.extracted == "current")
+                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "Extracted files: current (%s)", val.extracted_text.c_str());
+            else if (val.extracted == "stale")
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Extracted files: out of date (%s). Recompile imports the "
+                                   "chosen files; the current ones are kept until that succeeds.", val.extracted_text.c_str());
+            else if (val.extracted == "incomplete")
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Extracted files: incomplete (%s). Recompile finishes them.",
+                                   val.extracted_text.c_str());
+            else if (val.extracted == "none" && val.ok) ImGui::TextDisabled("Extracted files: none yet");
+        }
         if (busy) ImGui::BeginDisabled();
         if (ImGui::Button("Choose game folder...")) SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
         ImGui::SameLine();
         static const SDL_DialogFileFilter filters[] = {{"Game package", "xci;nsp;nca"}};
         if (ImGui::Button("Choose .xci / .nsp...")) SDL_ShowOpenFileDialog(picked, NULL, win, filters, 1, NULL, false);
+        // (an update next to the base in the chosen folder is found by its contents; this is for one kept elsewhere)
+        static const SDL_DialogFileFilter update_filters[] = {{"Game update", "nsp"}};
+        ImGui::SameLine();
+        if (ImGui::Button("Choose update .nsp...")) SDL_ShowOpenFileDialog(picked_update, NULL, win, update_filters, 1, NULL, false);
+        if (!upd.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("No update")) {
+                g_config.erase("update");
+                config_save();
+                start_validation(g_config["source"], "");
+            }
+        }
         if (busy) ImGui::EndDisabled();
 
         // ---- what to do
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        bool ready = built.empty();
-        bool need_update = !g_dev && rel.ok && rel.newer;
+        // The game is built, and from the files chosen now: an extraction from another base / update / keys file
+        // (stale) or a half-finished one is rebuilt by Recompile, not played
+        bool extraction_old = val_current && (val.extracted == "stale" || val.extracted == "incomplete");
+        bool ready = built.empty() && !extraction_old;
+        std::string not_ready = !built.empty() ? built
+                              : extraction_old ? "the extracted game files don't match the chosen ones: " + val.extracted_text : "";
+        {   // (after a build, check again: the state shown must be the new extraction's)
+            static bool was_busy;
+            if (was_busy && !busy) start_validation(g_config["source"], g_config["update"]);
+            was_busy = busy;
+        }
+        bool need_update = (!g_dev || !update_from.empty()) && rel.ok && rel.newer;
+        if (auto_update && !busy && !g_checking && rel.checked) {  // (--update: once, whatever the check found)
+            auto_update = false;
+            if (need_update) start_workflow(true);
+        }
         bool can_build = tools.present && (source_ok || (have_files && src.empty()));
         if (auto_recompile && !busy && can_build) auto_recompile = false, start_workflow(false);
         if (auto_shaders && !busy && ready) auto_shaders = false, start_shaders_workflow();
@@ -1353,7 +1682,7 @@ int main(int argc, char **argv) {
                                  : ready ? (need_update ? "An update is available" : "Ready to play")
                                  : !tools.present ? (g_dev ? "Build the local package first (setup/build.ps1)" : "The tools need to be downloaded")
                                  : !can_build ? "Choose your game files"
-                                 : "Recompile to build the game for this version (" + built + ")";
+                                 : "Recompile to build the game for this version (" + not_ready + ")";
             if (need_update && (rel.required || !ready)) {
                 if (primary_button(rel.required || !ready ? "Update and recompile" : "Update")) start_workflow(true);
                 if (ready) {
@@ -1430,9 +1759,14 @@ int main(int argc, char **argv) {
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
         SDL_RenderPresent(ren);
+        {   // (the self-update waits for this: the restarted launcher is up and drawing)
+            static bool started;
+            if (!started) started = true, signal_parent("Started");
+        }
+        if (g_quit_for_update) quit = true;  // (the staged launcher took over the update: it waits for this one to end)
         if (!busy && !show_details) SDL_Delay(15);
     }
-    if (g_busy) {
+    if (g_busy && !g_quit_for_update) {  // (closing for the update: no tool is running, and the new launcher waits)
         cancel();
         for (int i = 0; i < 200 && g_busy; i++) SDL_Delay(10);
     }

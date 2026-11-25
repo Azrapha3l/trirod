@@ -102,7 +102,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 static const uint8_t BUILD_ID[8] = {0xa5, 0x81, 0x40, 0x6b, 0xc9, 0x85, 0x86, 0x51};  // Echoes of Wisdom v1.0.0 main (docs/STATUS.md)
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): alpha_<n> while the game isn't playable, beta_<n> until 1.0, then v<major>.<minor>.<patch>.
-#define EOWRECOMP_VERSION "v0.1.0"
+#define EOWRECOMP_VERSION "v0.2.0"
 
 // "Alpha 1" / "Beta 2" / "1.0.0" (with_word: "Version 1.0.0")
 static std::string tag_label(const std::string &t, bool with_word) {
@@ -878,7 +878,7 @@ static void reveal_folder(const std::string &dir) {
     bool abs = !path.empty() && (path[0] == '/' || path[0] == '\\' || (path.size() > 1 && path[1] == ':'));
     if (!abs) path = std::string(rt_data_root()) + "/" + path;
     std::string url = "file://";
-    if (path[0] != '/') url += "/";  // (Windows: file:///[local path omitted]
+    if (path[0] != '/') url += "/";  // (Windows: file:///C:/...)
     for (char ch : path) {
         if (ch == '\\') ch = '/';
         if (ch == ' ') url += "%20";
@@ -999,7 +999,7 @@ extern "C" void launcher_run(const char *root) {
     std::string own = rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo) ? baloo : "";
     const char *fonts[] = {getenv("EOWRECOMP_LAUNCHER_FONT") ? getenv("EOWRECOMP_LAUNCHER_FONT") : "",  // (test)
                            own.c_str(), "fonts/nintendo_udsgr_std_003.ttf", "/System/Library/Fonts/Avenir Next.ttc",
-                           "/System/Library/Fonts/Helvetica.ttc", "[local path omitted]"};
+                           "/System/Library/Fonts/Helvetica.ttc", "C:/Windows/Fonts/segoeui.ttf"};
     static const ImWchar ranges[] = {0x20, 0xFF, 0x2039, 0x203A, 0x2192, 0x2192, 0x2713, 0x2713, 0x25B8, 0x25B8, 0};  // + ‹ › → ✓ ▸
     for (const char *p : fonts) {
         if (g_font_menu || !*p || !file_exists(p)) continue;

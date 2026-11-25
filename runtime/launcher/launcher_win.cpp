@@ -1338,63 +1338,273 @@ static void style() {
     ImGuiStyle &s = ImGui::GetStyle();
     ImGui::StyleColorsDark();
     s.WindowRounding = 0;
-    s.FrameRounding = 5;
-    s.GrabRounding = 5;
-    s.ChildRounding = 6;
+    s.FrameRounding = 7;
+    s.GrabRounding = 7;
+    s.ChildRounding = 10;
+    s.PopupRounding = 8;
+    s.ScrollbarRounding = 8;
     s.FramePadding = ImVec2(10, 6);
-    s.ItemSpacing = ImVec2(10, 8);
+    s.ItemSpacing = ImVec2(8, 7);
+    s.WindowPadding = ImVec2(17, 14);
+    s.ChildBorderSize = 1;
+    s.FrameBorderSize = 1;
     ImVec4 *c = s.Colors;
-    c[ImGuiCol_WindowBg] = ImVec4(0.075f, 0.085f, 0.10f, 1);
-    c[ImGuiCol_ChildBg] = ImVec4(0.10f, 0.115f, 0.135f, 1);
-    c[ImGuiCol_Button] = ImVec4(0.18f, 0.22f, 0.28f, 1);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.30f, 0.38f, 1);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.28f, 0.36f, 0.46f, 1);
-    c[ImGuiCol_PlotHistogram] = ImVec4(0.30f, 0.66f, 0.45f, 1);
-    c[ImGuiCol_Header] = ImVec4(0.16f, 0.19f, 0.24f, 1);
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.22f, 0.27f, 0.34f, 1);
+    c[ImGuiCol_WindowBg] = ImVec4(0.035f, 0.045f, 0.052f, 1);
+    c[ImGuiCol_ChildBg] = ImVec4(0.075f, 0.085f, 0.090f, 0.96f);
+    c[ImGuiCol_Border] = ImVec4(0.59f, 0.47f, 0.25f, 0.92f);
+    c[ImGuiCol_FrameBg] = ImVec4(0.12f, 0.14f, 0.15f, 1);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.18f, 0.22f, 0.22f, 1);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.22f, 0.27f, 0.25f, 1);
+    c[ImGuiCol_Button] = ImVec4(0.16f, 0.18f, 0.19f, 1);
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.22f, 0.26f, 0.25f, 1);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.25f, 0.31f, 0.28f, 1);
+    c[ImGuiCol_CheckMark] = ImVec4(0.26f, 0.86f, 0.77f, 1);
+    c[ImGuiCol_SliderGrab] = ImVec4(0.87f, 0.66f, 0.18f, 1);
+    c[ImGuiCol_SliderGrabActive] = ImVec4(1.0f, 0.78f, 0.23f, 1);
+    c[ImGuiCol_PlotHistogram] = ImVec4(0.88f, 0.65f, 0.05f, 1);
+    c[ImGuiCol_Header] = ImVec4(0.13f, 0.20f, 0.20f, 1);
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.18f, 0.30f, 0.29f, 1);
+    c[ImGuiCol_HeaderActive] = ImVec4(0.22f, 0.36f, 0.33f, 1);
 }
 
-static bool primary_button(const char *label, bool enabled = true) {
+static const ImVec4 GOLD(0.96f, 0.73f, 0.13f, 1.0f);
+static const ImVec4 AQUA(0.24f, 0.85f, 0.77f, 1.0f);
+static SDL_Texture *g_launcher_logo;
+static SDL_Texture *g_launcher_skin;
+static int g_skin_text_child_id;
+
+static ImVec2 skin_point(float x, float y, float sx, float sy) {
+    ImVec2 origin = ImGui::GetWindowPos();
+    return ImVec2(origin.x + x * sx, origin.y + y * sy);
+}
+
+static void skin_text(const char *text, float x, float y, float width, float height,
+                      float sx, float sy, ImU32 color, ImFont *font = NULL, float font_size = 0.0f,
+                      bool centered = false) {
+    if (font) ImGui::PushFont(font);
+    ImGui::SetCursorPos(ImVec2(x * sx, y * sy));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::PushID(++g_skin_text_child_id);
+    ImGui::BeginChild("##skin-text", ImVec2(width * sx, height * sy), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    if (font && font_size > 0.0f) {
+        ImGui::SetWindowFontScale(font_size * std::min(sx, sy) / font->FontSize);
+        if (centered) {
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            ImVec2 text_size = ImGui::CalcTextSize(text);
+            ImGui::SetCursorPos(ImVec2(std::max(0.0f, (avail.x - text_size.x) * 0.5f),
+                                       std::max(0.0f, (avail.y - text_size.y) * 0.5f)));
+        }
+        ImGui::TextWrapped("%s", text);
+        ImGui::SetWindowFontScale(1.0f);
+    } else {
+        ImGui::TextWrapped("%s", text);
+    }
+    ImGui::EndChild();
+    ImGui::PopID();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    if (font) ImGui::PopFont();
+}
+
+static bool skin_button(const char *label, const char *id, float x, float y, float w, float h,
+                        float sx, float sy, bool enabled, ImFont *font = NULL, float font_size = 0.0f,
+                        ImU32 color = IM_COL32(238, 221, 177, 255)) {
+    ImGui::SetCursorPos(ImVec2(x * sx, y * sy));
     if (!enabled) ImGui::BeginDisabled();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.52f, 0.36f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.62f, 0.43f, 1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.18f, 0.46f, 0.32f, 1));
-    bool r = ImGui::Button(label, ImVec2(220, 0));
-    ImGui::PopStyleColor(3);
+    bool pressed = ImGui::InvisibleButton(id, ImVec2(w * sx, h * sy));
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    bool hovered = enabled && ImGui::IsItemHovered();
+    bool active = enabled && ImGui::IsItemActive();
     if (!enabled) ImGui::EndDisabled();
-    return r;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    if (!enabled) dl->AddRectFilled(a, b, IM_COL32(8, 13, 22, 105), 7.0f);
+    if (hovered) {
+        dl->AddRectFilled(a, b, IM_COL32(255, 246, 202, 48), 7.0f);
+        dl->AddRect(ImVec2(a.x + 2, a.y + 2), ImVec2(b.x - 2, b.y - 2), IM_COL32(255, 241, 184, 230), 7.0f, 0, 3.0f);
+    }
+    if (active) dl->AddRectFilled(a, b, IM_COL32(15, 20, 27, 48), 7.0f);
+    float fs = font_size > 0.0f ? font_size * std::min(sx, sy) : 18.0f * std::min(sx, sy);
+    ImFont *f = font ? font : ImGui::GetFont();
+    ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
+    ImU32 c = enabled ? color : IM_COL32(165, 162, 151, 220);
+    dl->AddText(f, fs, ImVec2((a.x + b.x - ts.x) * 0.5f, (a.y + b.y - ts.y) * 0.5f), c, label);
+    return pressed;
+}
+
+static void draw_brand_mark(ImVec2 pos, float size) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    if (g_launcher_logo) {
+        dl->AddImage((ImTextureID)(intptr_t)g_launcher_logo, pos, ImVec2(pos.x + size, pos.y + size));
+        return;
+    }
+    float w = size * 0.5f;
+    ImVec2 a(pos.x + w, pos.y), b(pos.x, pos.y + size), c(pos.x + size, pos.y + size);
+    dl->AddTriangleFilled(a, b, c, IM_COL32(232, 184, 55, 255));
+    ImVec2 d(pos.x + w, pos.y + size * 0.36f), e(pos.x + size * 0.24f, pos.y + size * 0.80f), f(pos.x + size * 0.76f, pos.y + size * 0.80f);
+    dl->AddTriangleFilled(d, e, f, IM_COL32(31, 43, 42, 255));
+    dl->AddTriangleFilled(ImVec2(pos.x + size * 0.75f, pos.y + size * 0.10f),
+                          ImVec2(pos.x + size * 0.53f, pos.y + size * 0.48f),
+                          ImVec2(pos.x + size * 0.97f, pos.y + size * 0.48f), IM_COL32(60, 208, 191, 255));
+    dl->AddTriangle(ImVec2(pos.x + w, pos.y), b, c, IM_COL32(255, 226, 132, 255), 1.5f);
+}
+
+static void draw_background_motifs() {
+    ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float start = p.x + s.x * 0.59f;
+    for (int i = 0; i < 23; i++) {
+        float x = start + (float)((i * 137) % (int)std::max(1.0f, s.x * 0.39f));
+        float y = p.y + 12.0f + (float)((i * 83) % (int)std::max(1.0f, s.y * 0.44f));
+        float z = 7.0f + (float)(i % 4) * 4.0f;
+        ImU32 col = i % 3 == 0 ? IM_COL32(66, 192, 181, 34) : IM_COL32(226, 183, 83, 32);
+        dl->AddTriangle(ImVec2(x, y), ImVec2(x + z, y + z * 1.35f), ImVec2(x - z * 0.8f, y + z), col, 1.0f);
+    }
+    float x = p.x + s.x * 0.80f, y = p.y + 10.0f, z = std::min(170.0f, s.x * 0.16f);
+    dl->AddTriangle(ImVec2(x, y), ImVec2(x - z * 0.54f, y + z), ImVec2(x + z * 0.54f, y + z), IM_COL32(212, 172, 72, 18), 2.0f);
+    dl->AddRect(ImVec2(p.x + 2, p.y + 2), ImVec2(p.x + s.x - 2, p.y + s.y - 2), IM_COL32(125, 105, 67, 180), 7.0f, 0, 1.5f);
+    dl->AddRect(ImVec2(p.x + 6, p.y + 6), ImVec2(p.x + s.x - 6, p.y + s.y - 6), IM_COL32(58, 78, 76, 140), 6.0f, 0, 1.0f);
+}
+
+static void draw_ornate_child_frame() {
+    ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImU32 outer = IM_COL32(181, 145, 76, 245), inner = IM_COL32(83, 70, 47, 245);
+    dl->AddRectFilled(ImVec2(p.x + 1, p.y + 1), ImVec2(p.x + s.x - 1, p.y + s.y - 1), IM_COL32(10, 14, 16, 70), 7.0f);
+    dl->AddRect(ImVec2(p.x + 1, p.y + 1), ImVec2(p.x + s.x - 1, p.y + s.y - 1), outer, 7.0f, 0, 2.0f);
+    dl->AddRect(ImVec2(p.x + 5, p.y + 5), ImVec2(p.x + s.x - 5, p.y + s.y - 5), inner, 5.0f, 0, 1.0f);
+    dl->AddLine(ImVec2(p.x + 18, p.y + 4), ImVec2(p.x + s.x - 18, p.y + 4), IM_COL32(237, 203, 132, 190), 1.0f);
+    dl->AddLine(ImVec2(p.x + 18, p.y + s.y - 4), ImVec2(p.x + s.x - 18, p.y + s.y - 4), IM_COL32(63, 53, 39, 220), 1.0f);
+    const float k = 17.0f;
+    for (int i = 0; i < 4; i++) {
+        float x = i & 1 ? p.x + s.x - 7.0f : p.x + 7.0f;
+        float y = i & 2 ? p.y + s.y - 7.0f : p.y + 7.0f;
+        float dx = i & 1 ? -k : k, dy = i & 2 ? -k : k;
+        dl->AddTriangleFilled(ImVec2(x, y), ImVec2(x + dx, y), ImVec2(x, y + dy), IM_COL32(82, 66, 39, 220));
+        dl->AddLine(ImVec2(x, y + dy), ImVec2(x, y), IM_COL32(230, 195, 114, 245), 2.0f);
+        dl->AddLine(ImVec2(x, y), ImVec2(x + dx, y), IM_COL32(230, 195, 114, 245), 2.0f);
+        dl->AddCircleFilled(ImVec2(x, y), 2.7f, IM_COL32(248, 220, 153, 255));
+        dl->AddCircle(ImVec2(x, y), 4.0f, IM_COL32(121, 91, 46, 235), 8, 1.0f);
+    }
+}
+
+static void draw_section_plate(const char *label, ImFont *serif = NULL) {
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float width = std::min(ImGui::GetContentRegionAvail().x * 0.70f, 310.0f);
+    float x = p.x + (ImGui::GetContentRegionAvail().x - width) * 0.5f;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddTriangleFilled(ImVec2(x - 8, p.y + 7), ImVec2(x, p.y + 1), ImVec2(x, p.y + 29), IM_COL32(111, 85, 43, 245));
+    dl->AddTriangleFilled(ImVec2(x + width + 8, p.y + 7), ImVec2(x + width, p.y + 1), ImVec2(x + width, p.y + 29), IM_COL32(111, 85, 43, 245));
+    dl->AddRectFilled(ImVec2(x, p.y + 1), ImVec2(x + width, p.y + 29), IM_COL32(42, 39, 31, 240), 4.0f);
+    dl->AddRect(ImVec2(x, p.y + 1), ImVec2(x + width, p.y + 29), IM_COL32(180, 145, 74, 235), 4.0f, 0, 1.5f);
+    dl->AddLine(ImVec2(p.x + 8, p.y + 15), ImVec2(x - 8, p.y + 15), IM_COL32(190, 151, 76, 215), 1.0f);
+    dl->AddLine(ImVec2(x + width + 8, p.y + 15), ImVec2(p.x + ImGui::GetContentRegionAvail().x - 8, p.y + 15), IM_COL32(190, 151, 76, 215), 1.0f);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - width) * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_Text, GOLD);
+    if (serif) ImGui::PushFont(serif);
+    ImGui::TextUnformatted(label);
+    if (serif) ImGui::PopFont();
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 2));
+}
+
+static bool launcher_button(const char *label, bool enabled, ImVec2 size, bool primary, ImFont *font, ImU32 accent) {
+    if (font) ImGui::PushFont(font);
+    if (size.x == 0.0f) size.x = ImGui::GetContentRegionAvail().x;
+    if (size.y == 0.0f) size.y = ImGui::GetFrameHeight();
+    if (!enabled) ImGui::BeginDisabled();
+    bool pressed = ImGui::InvisibleButton(label, size);
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    bool hovered = enabled && ImGui::IsItemHovered();
+    bool active = enabled && ImGui::IsItemActive();
+    if (!enabled) ImGui::EndDisabled();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float alpha = enabled ? 1.0f : 0.42f;
+    float round = primary ? 9.0f : 6.0f;
+    if (primary) {
+        if (hovered) dl->AddRect(ImVec2(a.x - 3, a.y - 3), ImVec2(b.x + 3, b.y + 3), IM_COL32(255, 220, 106, 95), round + 3, 0, 3.0f);
+        dl->AddRectFilled(ImVec2(a.x - 1, a.y - 1), ImVec2(b.x + 1, b.y + 2), IM_COL32(103, 69, 15, (int)(255 * alpha)), round + 1);
+        dl->AddRectFilled(a, b, IM_COL32(245, 203, 87, (int)(255 * alpha)), round);
+        ImVec2 lo(a.x + 4, a.y + 4), hi(b.x - 4, b.y - 4);
+        dl->AddRectFilledMultiColor(lo, hi,
+            active ? IM_COL32(196, 132, 20, (int)(255 * alpha)) : IM_COL32(255, 238, 153, (int)(255 * alpha)),
+            active ? IM_COL32(191, 126, 16, (int)(255 * alpha)) : IM_COL32(255, 221, 103, (int)(255 * alpha)),
+            IM_COL32(192, 127, 17, (int)(255 * alpha)), IM_COL32(225, 165, 36, (int)(255 * alpha)));
+        dl->AddRect(lo, hi, IM_COL32(255, 244, 186, (int)(230 * alpha)), round - 2, 0, 1.0f);
+        dl->AddLine(ImVec2(lo.x + 12, lo.y + 2), ImVec2(hi.x - 12, lo.y + 2), IM_COL32(255, 249, 205, (int)(180 * alpha)), 1.0f);
+    } else {
+        dl->AddRectFilled(ImVec2(a.x - 1, a.y - 1), ImVec2(b.x + 1, b.y + 2), IM_COL32(24, 29, 31, (int)(255 * alpha)), round + 1);
+        dl->AddRect(ImVec2(a.x - 1, a.y - 1), ImVec2(b.x + 1, b.y + 1), accent, round + 1, 0, 2.0f);
+        ImVec2 lo(a.x + 3, a.y + 3), hi(b.x - 3, b.y - 3);
+        ImU32 top = hovered ? IM_COL32(76, 91, 91, (int)(255 * alpha)) : IM_COL32(56, 67, 68, (int)(255 * alpha));
+        ImU32 bottom = active ? IM_COL32(28, 37, 39, (int)(255 * alpha)) : IM_COL32(39, 47, 48, (int)(255 * alpha));
+        dl->AddRectFilledMultiColor(lo, hi, top, top, bottom, bottom);
+        dl->AddRect(lo, hi, IM_COL32(139, 153, 145, (int)(125 * alpha)), round - 2, 0, 1.0f);
+        dl->AddLine(ImVec2(a.x + 12, a.y + 4), ImVec2(b.x - 12, a.y + 4), IM_COL32(211, 199, 154, (int)(115 * alpha)), 1.0f);
+    }
+    float gem_x = primary ? 13.0f : 8.0f, gem_y = primary ? 13.0f : 8.0f;
+    for (int side = 0; side < 2; side++) {
+        float x = side ? b.x - gem_x : a.x + gem_x;
+        float y = (a.y + b.y) * 0.5f;
+        dl->AddQuadFilled(ImVec2(x, y - gem_y), ImVec2(x + gem_x * 0.45f, y), ImVec2(x, y + gem_y), ImVec2(x - gem_x * 0.45f, y),
+                          primary ? IM_COL32(255, 248, 198, (int)(225 * alpha)) : accent);
+    }
+    ImFont *label_font = font ? font : ImGui::GetFont();
+    float label_size = label_font->FontSize;
+    ImVec2 text_size = label_font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, label);
+    ImVec2 text_pos((a.x + b.x - text_size.x) * 0.5f, (a.y + b.y - text_size.y) * 0.5f);
+    ImU32 text_col = primary ? IM_COL32(45, 34, 13, (int)(255 * alpha)) : IM_COL32(235, 228, 205, (int)(255 * alpha));
+    dl->AddText(label_font, label_size, text_pos, text_col, label);
+    if (font) ImGui::PopFont();
+    return pressed;
+}
+
+static bool primary_button(const char *label, bool enabled = true, ImVec2 size = ImVec2(220, 0), ImFont *display = NULL) {
+    return launcher_button(label, enabled, size, true, display, IM_COL32(246, 203, 95, 255));
+}
+
+static bool stone_button(const char *label, ImVec2 size, bool enabled = true, ImU32 accent = IM_COL32(184, 150, 79, 255)) {
+    return launcher_button(label, enabled, size, false, NULL, accent);
 }
 
 static void draw_steps(const std::vector<Step> &steps) {
     for (auto &s : steps) {
-        const char *mark = "  ";
-        ImVec4 c(0.6f, 0.6f, 0.6f, 1);
+        ImVec4 c(0.60f, 0.62f, 0.59f, 1);
         switch (s.state) {
-        case StepState::Pending: mark = "-"; break;
-        case StepState::Running: mark = ">"; c = ImVec4(0.55f, 0.78f, 1, 1); break;
-        case StepState::Done: mark = "OK"; c = ImVec4(0.45f, 0.85f, 0.55f, 1); break;
-        case StepState::Failed: mark = "X"; c = ImVec4(1, 0.45f, 0.4f, 1); break;
-        case StepState::Warned: mark = "!"; c = ImVec4(1, 0.8f, 0.35f, 1); break;
-        case StepState::Skipped: mark = "~"; c = ImVec4(1, 0.8f, 0.35f, 1); break;
+        case StepState::Running: c = ImVec4(0.98f, 0.79f, 0.37f, 1); break;
+        case StepState::Done: c = ImVec4(0.46f, 0.91f, 0.72f, 1); break;
+        case StepState::Failed: c = ImVec4(1, 0.38f, 0.33f, 1); break;
+        case StepState::Warned: case StepState::Skipped: c = ImVec4(1, 0.77f, 0.31f, 1); break;
+        case StepState::Pending: break;
         }
-        ImGui::TextColored(c, "%-2s", mark);
-        ImGui::SameLine(40);
-        ImGui::TextColored(s.state == StepState::Pending ? ImVec4(0.6f, 0.6f, 0.6f, 1) : ImVec4(1, 1, 1, 1), "%s", s.title.c_str());
-        if (s.state == StepState::Running) {
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60);
-            ImGui::Text("%3d%%", (int)std::lround(s.progress * 100));
-            ImGui::Indent(30);
-            ImGui::ProgressBar((float)s.progress, ImVec2(-1, 6), "");
-            if (!s.text.empty()) ImGui::TextDisabled("%s", s.text.c_str());
-            if (!s.tool.empty()) ImGui::TextDisabled("Running: %.300s", s.tool.c_str());
-            ImGui::Unindent(30);
+        ImVec2 icon = ImGui::GetCursorScreenPos();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        float cx = icon.x + 15.0f, cy = icon.y + 15.0f;
+        const float r = 14.0f;
+        ImVec2 top(cx, cy - r), right(cx + r, cy), bottom(cx, cy + r), left(cx - r, cy);
+        if (s.state == StepState::Done) {
+            dl->AddQuadFilled(top, right, bottom, left, IM_COL32(40, 174, 131, 255));
+            dl->AddQuad(top, right, bottom, left, IM_COL32(139, 255, 221, 255), 1.8f);
         } else {
-            ImGui::Indent(30);
-            if (!s.note.empty()) ImGui::TextColored(c, "%s", s.note.c_str());
-            if (s.state == StepState::Done || s.state == StepState::Warned || s.state == StepState::Skipped)
-                for (auto &i : s.info) ImGui::TextDisabled("%s", i.c_str());
-            ImGui::Unindent(30);
+            ImU32 edge = s.state == StepState::Running ? IM_COL32(255, 211, 105, 255)
+                       : s.state == StepState::Failed ? IM_COL32(252, 108, 93, 255)
+                       : s.state == StepState::Warned || s.state == StepState::Skipped ? IM_COL32(234, 184, 69, 255)
+                       : IM_COL32(164, 177, 165, 255);
+            float thickness = s.state == StepState::Running ? 2.7f : 2.0f;
+            dl->AddQuad(top, right, bottom, left, edge, thickness);
         }
+        std::string title = s.title;
+        if (title.size() >= 3 && title[0] >= '0' && title[0] <= '9' && title[1] == '.' && title[2] == ' ')
+            title.erase(0, 3);
+        ImVec4 title_color = s.state == StepState::Pending ? ImVec4(0.69f, 0.71f, 0.72f, 1) : c;
+        ImGui::SetCursorScreenPos(ImVec2(icon.x + 40, icon.y + 2));
+        ImGui::PushTextWrapPos();
+        ImGui::TextColored(title_color, "%s", title.c_str());
+        ImGui::PopTextWrapPos();
+        // Keep the stage column to one stable row per step. Progress and
+        // compiler details belong in the details pane, not beneath the stage.
+        ImGui::SetCursorScreenPos(ImVec2(icon.x, icon.y + 36));
     }
 }
 
@@ -1404,7 +1614,7 @@ static std::string shader_summary() {
     std::string st = j["status"].str();
     if (st == "skipped") return "Shaders: left to the game (" + j["reason"].str() + ")";
     char b[400];
-    snprintf(b, sizeof b, "Shaders prepared for %s: %d recorded pipelines, %d of the game's shader programs as SPIR-V",
+    snprintf(b, sizeof b, "%.30s | %d pipelines | %d SPIR-V shaders",
              j["device"]["name"].str().c_str(), (int)j["recipes"]["pipelines_ok"].num(), (int)j["catalog"]["spirv_ok"].num());
     return b;
 }
@@ -1488,17 +1698,30 @@ int main(int argc, char **argv) {
     }
     float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (scale <= 0) scale = 1;
-    SDL_Window *win = SDL_CreateWindow("TriRod", (int)(920 * scale), (int)(680 * scale), SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_Window *win = SDL_CreateWindow("TriRod", (int)(1280 * scale), (int)(720 * scale), SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     SDL_Renderer *ren = win ? SDL_CreateRenderer(win, NULL) : NULL;
     if (!ren) {
         MessageBoxA(NULL, SDL_GetError(), "Trirod Launcher", MB_ICONERROR);
         return 1;
     }
+    SDL_SetWindowMinimumSize(win, (int)(1080 * scale), (int)(608 * scale));
     SDL_SetRenderVSync(ren, 1);
     {
         std::string ico = g_paths.install + "\\icon.png";
         SDL_Surface *s = file_exists(ico) ? SDL_LoadPNG(ico.c_str()) : NULL;
-        if (s) SDL_SetWindowIcon(win, s), SDL_DestroySurface(s);
+        if (s) {
+            SDL_SetWindowIcon(win, s);
+            SDL_DestroySurface(s);
+        }
+    }
+    {
+        std::string skin = g_paths.install + "\\launcher-skin.png";
+        SDL_Surface *s = file_exists(skin) ? SDL_LoadPNG(skin.c_str()) : NULL;
+        if (s) {
+            g_launcher_skin = SDL_CreateTextureFromSurface(ren, s);
+            if (g_launcher_skin) SDL_SetTextureScaleMode(g_launcher_skin, SDL_SCALEMODE_LINEAR);
+            SDL_DestroySurface(s);
+        }
     }
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1510,8 +1733,13 @@ int main(int argc, char **argv) {
     wchar_t windir[MAX_PATH];
     GetWindowsDirectoryW(windir, MAX_PATH);
     std::string ui_font = narrow(windir) + "\\Fonts\\segoeui.ttf", ui_bold = narrow(windir) + "\\Fonts\\segoeuib.ttf";
+    std::string ui_serif = narrow(windir) + "\\Fonts\\georgiab.ttf";
     ImFont *font = file_exists(ui_font) ? io.Fonts->AddFontFromFileTTF(ui_font.c_str(), 17 * scale) : NULL;
+    ImFont *step_font = file_exists(ui_font) ? io.Fonts->AddFontFromFileTTF(ui_font.c_str(), 24 * scale) : NULL;
+    ImFont *log_font = file_exists(ui_font) ? io.Fonts->AddFontFromFileTTF(ui_font.c_str(), 26 * scale) : NULL;
     ImFont *big = file_exists(ui_bold) ? io.Fonts->AddFontFromFileTTF(ui_bold.c_str(), 30 * scale) : NULL;
+    ImFont *display = file_exists(ui_serif) ? io.Fonts->AddFontFromFileTTF(ui_serif.c_str(), 31 * scale) : NULL;
+    ImFont *serif = file_exists(ui_serif) ? io.Fonts->AddFontFromFileTTF(ui_serif.c_str(), 16 * scale) : NULL;
     if (!font) font = io.Fonts->AddFontDefault();
     ImGui_ImplSDL3_InitForSDLRenderer(win, ren);
     ImGui_ImplSDLRenderer3_Init(ren);
@@ -1531,7 +1759,7 @@ int main(int argc, char **argv) {
             g_checking = false;
         }).detach();
     }
-    bool show_details = false, quit = false, follow = true;
+    bool show_details = true, quit = false, follow = true;
     std::string play_error;
     while (!quit) {
         SDL_Event e;
@@ -1579,83 +1807,8 @@ int main(int argc, char **argv) {
         bool have_files = file_exists(g_paths.extracted() + "\\exefs\\main");
         bool source_ok = val.done && val.ok;
 
-        ImGui_ImplSDLRenderer3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
-        ImGui::SetNextWindowPos(ImVec2(0, 0));
-        ImGui::SetNextWindowSize(io.DisplaySize);
-        ImGui::Begin("##main", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-        if (big) ImGui::PushFont(big);
-        ImGui::Text("TriRod");
-        if (big) ImGui::PopFont();
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s  %s", version_label(tools.present ? tools.version : TRIROD_VERSION).c_str(),
-                            g_dev ? "| Development mode" : "");
-        ImGui::TextDisabled("Fan project, not affiliated with Nintendo. Needs your own legally obtained copy of the game (v1.0.0, or v1.1.0 with its update).");
-        ImGui::Separator();
-
-        // ---- updates
-        if (g_dev && update_from.empty())
-            ImGui::TextColored(ImVec4(0.55f, 0.78f, 1, 1), "Development mode: no update check or download; tools from %s",
-                               g_paths.install.c_str());
-        else if (g_checking) ImGui::TextDisabled("Checking for updates...");
-        else if (!rel.ok) ImGui::TextDisabled("Updates: %s", rel.why.c_str());
-        else if (rel.newer) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Update available: %s%s%s%s", version_label(rel.version).c_str(),
-                                               rel.local_file.empty() ? "" : " (from a local folder)",
-                                               rel.new_launcher ? " (includes a new launcher: it restarts)" : "",
-                                               rel.required ? " (the game will be recompiled)" : "");
-        else ImGui::TextDisabled("Up to date (%s)", version_label(rel.version).c_str());
-        if (!g_notice.empty()) ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "%s", g_notice.c_str());
-        if (!tools.present) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "Build tools missing: %s", tools.why.c_str());
-
-        // ---- game files
-        ImGui::Spacing();
-        ImGui::Text("Your game files");
         std::string src = g_config["source"], upd = g_config["update"];
-        ImGui::TextDisabled("%s", src.empty() ? (have_files ? "(already prepared in the data folder)" : "Not chosen yet")
-                                              : src.c_str());
-        if (!upd.empty()) ImGui::TextDisabled("Update: %s", upd.c_str());
-        // (what the check found applies to this selection only; a new pick starts a new check)
         bool val_current = val.done && val.for_source == src && val.for_update == upd;
-        if (val.running) ImGui::TextDisabled("Checking...");
-        else if (val_current) {
-            ImGui::TextColored(val.ok ? ImVec4(0.45f, 0.85f, 0.55f, 1) : ImVec4(1, 0.45f, 0.4f, 1), "%s%s",
-                               val.ok && !src.empty() ? "Detected: " : "", val.text.c_str());
-            if (val.extracted == "current")
-                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.55f, 1), "Extracted files: current (%s)", val.extracted_text.c_str());
-            else if (val.extracted == "stale")
-                ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Extracted files: out of date (%s). Recompile imports the "
-                                   "chosen files; the current ones are kept until that succeeds.", val.extracted_text.c_str());
-            else if (val.extracted == "incomplete")
-                ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Extracted files: incomplete (%s). Recompile finishes them.",
-                                   val.extracted_text.c_str());
-            else if (val.extracted == "none" && val.ok) ImGui::TextDisabled("Extracted files: none yet");
-        }
-        if (busy) ImGui::BeginDisabled();
-        if (ImGui::Button("Choose game folder...")) SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
-        ImGui::SameLine();
-        static const SDL_DialogFileFilter filters[] = {{"Game package", "xci;nsp;nca"}};
-        if (ImGui::Button("Choose .xci / .nsp...")) SDL_ShowOpenFileDialog(picked, NULL, win, filters, 1, NULL, false);
-        // (an update next to the base in the chosen folder is found by its contents; this is for one kept elsewhere)
-        static const SDL_DialogFileFilter update_filters[] = {{"Game update", "nsp"}};
-        ImGui::SameLine();
-        if (ImGui::Button("Choose update .nsp...")) SDL_ShowOpenFileDialog(picked_update, NULL, win, update_filters, 1, NULL, false);
-        if (!upd.empty()) {
-            ImGui::SameLine();
-            if (ImGui::Button("No update")) {
-                g_config.erase("update");
-                config_save();
-                start_validation(g_config["source"], "");
-            }
-        }
-        if (busy) ImGui::EndDisabled();
-
-        // ---- what to do
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        // The game is built, and from the files chosen now: an extraction from another base / update / keys file
-        // (stale) or a half-finished one is rebuilt by Recompile, not played
         bool extraction_old = val_current && (val.extracted == "stale" || val.extracted == "incomplete");
         bool ready = built.empty() && !extraction_old;
         std::string not_ready = !built.empty() ? built
@@ -1673,87 +1826,154 @@ int main(int argc, char **argv) {
         bool can_build = tools.present && (source_ok || (have_files && src.empty()));
         if (auto_recompile && !busy && can_build) auto_recompile = false, start_workflow(false);
         if (auto_shaders && !busy && ready) auto_shaders = false, start_shaders_workflow();
-        if (busy) {
-            if (ImGui::Button("Cancel", ImVec2(220, 0))) cancel();
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", status.c_str());
-        } else {
-            std::string headline = !status.empty() && !g_build_ok_once && !error.empty() ? status
-                                 : ready ? (need_update ? "An update is available" : "Ready to play")
-                                 : !tools.present ? (g_dev ? "Build the local package first (setup/build.ps1)" : "The tools need to be downloaded")
-                                 : !can_build ? "Choose your game files"
-                                 : "Recompile to build the game for this version (" + not_ready + ")";
-            if (need_update && (rel.required || !ready)) {
-                if (primary_button(rel.required || !ready ? "Update and recompile" : "Update")) start_workflow(true);
-                if (ready) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Play installed version", ImVec2(220, 0))) {
-                        if (play(play_error)) quit = true;
-                    }
-                }
-            } else if (ready) {
-                if (primary_button("Play")) {
-                    if (play(play_error)) quit = !g_dev;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Recompile", ImVec2(160, 0))) start_workflow(false);
-                ImGui::SameLine();
-                if (ImGui::Button("Prepare shaders", ImVec2(160, 0))) start_shaders_workflow();
-                if (need_update) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Update", ImVec2(160, 0))) start_workflow(true);
-                }
-            } else if (!tools.present && !g_dev && rel.ok) {
-                if (primary_button("Download tools and build")) start_workflow(true);
-            } else {
-                if (primary_button("Recompile", can_build)) start_workflow(false);
-            }
-            ImGui::TextDisabled("%s", headline.c_str());
-            if (ready && !stale.empty())
-                ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Shaders: %s. Prepare shaders to build them before playing "
-                                   "(the game otherwise builds them as it goes).", stale.c_str());
-            if (ready) {
-                std::string sh = shader_summary();
-                if (!sh.empty()) ImGui::TextDisabled("%s", sh.c_str());
-            }
-            if (!play_error.empty()) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s", play_error.c_str());
-        }
-        if (!error.empty()) ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "%s", error.c_str());
+        std::string headline = !status.empty() && !g_build_ok_once && !error.empty() ? status
+                             : ready ? (need_update ? "An update is available" : "Ready to play")
+                             : !tools.present ? (g_dev ? "Build the local package first (setup/build.ps1)" : "The tools need to be downloaded")
+                             : !can_build ? "Choose your game files"
+                             : "Recompile to build the game for this version (" + not_ready + ")";
 
-        // ---- progress and details
-        if (!steps.empty()) {
-            ImGui::Spacing();
-            draw_steps(steps);
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::Begin("##main", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        g_skin_text_child_id = 0;
+        const float sx = io.DisplaySize.x / 1678.0f, sy = io.DisplaySize.y / 943.0f;
+        ImDrawList *canvas = ImGui::GetWindowDrawList();
+        if (g_launcher_skin) canvas->AddImage((ImTextureID)(intptr_t)g_launcher_skin, skin_point(0, 0, sx, sy), skin_point(1678, 943, sx, sy));
+        else draw_background_motifs();
+
+        std::string version = version_label(tools.present ? tools.version : TRIROD_VERSION);
+        skin_text("TriRod", 200, 51, 242, 72, sx, sy, IM_COL32(246, 226, 182, 255), display, 52);
+        skin_text(version.c_str(), 443, 75, 150, 40, sx, sy, IM_COL32(224, 190, 111, 255), serif, 22);
+        skin_text("Fan project, not affiliated with Nintendo. Requires your own legally obtained game copy.",
+                  202, 120, 890, 32, sx, sy, IM_COL32(199, 201, 204, 255), font, 21);
+        ImU32 state_col = busy ? IM_COL32(114, 219, 240, 255) : ready ? IM_COL32(227, 198, 107, 255) : IM_COL32(242, 181, 84, 255);
+        const char *state_label = busy ? "Working" : ready ? "This app is ready" : "Setup needed";
+        skin_text(state_label, 202, 153, 540, 34, sx, sy, state_col, font, 23);
+        if (g_dev && update_from.empty()) skin_text("Development build - local tools", 747, 153, 300, 28, sx, sy, IM_COL32(136, 214, 237, 255), font, 21);
+        else if (g_checking) skin_text("Checking for updates...", 747, 153, 300, 28, sx, sy, IM_COL32(214, 219, 219, 255), font, 21);
+        else if (rel.newer) skin_text(("Update available: " + version_label(rel.version)).c_str(), 747, 153, 300, 28, sx, sy, IM_COL32(255, 216, 122, 255), font, 21);
+
+        skin_text("YOUR GAME FILES", 370, 200, 250, 34, sx, sy, IM_COL32(245, 220, 163, 255), serif, 23, true);
+        const std::string source_line = src.empty() ? (have_files ? g_paths.data : "Choose a game folder or package") : src;
+        skin_text(source_line.c_str(), 176, 245, 640, 40, sx, sy, IM_COL32(248, 237, 211, 255), font, 22);
+        const char *base_state = source_ok || (have_files && src.empty()) ? "OK" : "Not selected";
+        skin_text((std::string("Base Game: ") + base_state).c_str(), 178, 292, 585, 32, sx, sy,
+                  source_ok || (have_files && src.empty()) ? IM_COL32(84, 232, 207, 255) : IM_COL32(226, 213, 177, 255), font, 24);
+        std::string update_file = upd;
+        size_t update_leaf = update_file.find_last_of("/\\");
+        if (update_leaf != std::string::npos) update_file = update_file.substr(update_leaf + 1);
+        std::string update_line = upd.empty() ? "Update Candidate: optional; auto-detected" : "Update Candidate: " + update_file;
+        skin_text(update_line.c_str(), 178, 331, 435, 42, sx, sy, IM_COL32(245, 230, 194, 255), font, 21);
+        skin_text(val.running ? "prod.keys: checking..." : val_current && val.ok ? "prod.keys: valid" : val_current && !val.ok ? "prod.keys: check failed" : "prod.keys: checked during Recompile",
+                  178, 375, 620, 32, sx, sy, val_current && val.ok ? IM_COL32(84, 232, 207, 255) : IM_COL32(242, 226, 191, 255), font, 24);
+
+        static const SDL_DialogFileFilter filters[] = {{"Game package", "xci;nsp;nca"}};
+        static const SDL_DialogFileFilter update_filters[] = {{"Game update", "nsp"}};
+        if (skin_button("CHOOSE GAME FOLDER...", "##pick-folder", 168, 422, 316, 65, sx, sy, !busy, serif, 20))
+            SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
+        if (skin_button("CHOOSE XCI / NSP...", "##pick-package", 516, 422, 302, 65, sx, sy, !busy, serif, 20))
+            SDL_ShowOpenFileDialog(picked, NULL, win, filters, 1, NULL, false);
+        if (skin_button(upd.empty() ? "SET UPDATE NSP" : "REPLACE UPDATE NSP", "##pick-update", 620, 331, 175, 38, sx, sy, !busy, font, 17, IM_COL32(105, 212, 197, 255)))
+            SDL_ShowOpenFileDialog(picked_update, NULL, win, update_filters, 1, NULL, false);
+        if (!upd.empty() && skin_button("REMOVE", "##remove-update", 796, 331, 48, 38, sx, sy, !busy, font, 12, IM_COL32(255, 151, 125, 255))) {
+            g_config.erase("update"); config_save(); start_validation(g_config["source"], "");
         }
-        ImGui::Spacing();
-        if (ImGui::Checkbox("Show details", &show_details)) {}
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Open logs folder")) { CreateDirectoryW(widen(g_paths.logs()).c_str(), NULL); open_folder(g_paths.logs()); }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Open data folder")) open_folder(g_paths.data);
+
+        const char *main_action = busy ? "WORKING" : need_update && !ready ? "UPDATE & RECOMPILE" : "PLAY";
+        if (skin_button(main_action, "##main-action", 1055, 204, 412, 111, sx, sy,
+                        !busy && (ready || (need_update && (rel.required || !ready))), display, 52,
+                        IM_COL32(69, 48, 17, 255))) {
+            if (ready) { if (play(play_error)) quit = !g_dev; }
+            else if (need_update && (rel.required || !ready)) start_workflow(true);
+        }
+        if (busy) {
+            if (skin_button("CANCEL", "##cancel", 979, 336, 272, 63, sx, sy, true, serif, 21)) cancel();
+        } else {
+            if (skin_button("RECOMPILE", "##recompile", 979, 336, 272, 63, sx, sy, !busy && can_build, serif, 21)) start_workflow(false);
+            if (skin_button("PREPARE SHADERS", "##prepare-shaders", 1269, 336, 274, 63, sx, sy, !busy && ready, serif, 19,
+                            IM_COL32(185, 249, 244, 255))) start_shaders_workflow();
+        }
+        if (need_update && ready) {
+            std::string update_label = "Update available: " + version_label(rel.version) + " (click to install)";
+            if (skin_button(update_label.c_str(), "##install-update", 1000, 411, 560, 44, sx, sy, true, font, 18, IM_COL32(247, 204, 103, 255)))
+                start_workflow(true);
+        } else {
+            const char *summary_line = busy ? (status.empty() ? "Working..." : status.c_str()) : ready ? "Ready to play"
+                                     : need_update ? "An update is available" : "Choose Recompile to build the game";
+            skin_text(summary_line, 1090, 411, 500, 44, sx, sy,
+                      ready ? IM_COL32(218, 230, 143, 255) : IM_COL32(255, 218, 147, 255), font, 27);
+        }
+        std::string summary = shader_summary();
+        if (summary.empty()) summary = g_dev && update_from.empty() ? "Development build: shader preparation status appears here" : "Vulkan device, pipelines and SPIR-V shader status";
+        canvas->AddRectFilled(skin_point(1102, 461, sx, sy), skin_point(1564, 506, sx, sy), IM_COL32(8, 32, 39, 205), 8.0f * std::min(sx, sy));
+        skin_text(summary.c_str(), 1117, 467, 432, 34, sx, sy, IM_COL32(139, 241, 244, 255), font, 21);
+
+        ImGui::SetCursorPos(ImVec2(86 * sx, 555 * sy));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::BeginChild("##skin-steps", ImVec2(906 * sx, 276 * sy), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
+        if (step_font) ImGui::PushFont(step_font);
+        if (steps.empty()) {
+            static const std::vector<Step> idle_steps = {
+                {"files", "Preparing game files"},
+                {"translate", "2. Translating game code for PC"},
+                {"compile", "3. Compiling and linking the generated code"},
+                {"shaders", "4. Preparing shaders for the graphics device"}
+            };
+            draw_steps(idle_steps);
+        } else draw_steps(steps);
+        if (step_font) ImGui::PopFont();
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        canvas->AddLine(skin_point(1011, 558, sx, sy), skin_point(1011, 837, sx, sy), IM_COL32(172, 165, 142, 100), 1.0f * std::min(sx, sy));
+        ImGui::SetCursorPos(ImVec2(1030 * sx, 556 * sy));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(238, 236, 222, 255));
+        if (log_font) ImGui::PushFont(log_font);
+        ImGui::BeginChild("##skin-log", ImVec2(548 * sx, 280 * sy), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoBackground);
         if (show_details) {
-            ImGui::SameLine();
-            ImGui::Checkbox("Follow", &follow);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Copy")) {
-                std::string all;
-                for (auto &l : log) all += l.text + "\n";
-                SDL_SetClipboardText(all.c_str());
+            for (int i = 0; i < (int)log.size(); ++i) {
+                const LogLine &l = log[(size_t)i];
+                ImVec4 c = l.kind == 1 ? ImVec4(0.52f, 0.91f, 1.00f, 1) : l.kind == 2 ? ImVec4(1, 0.55f, 0.47f, 1)
+                         : l.kind == 3 ? ImVec4(0.58f, 0.98f, 0.78f, 1) : ImVec4(0.93f, 0.92f, 0.87f, 1);
+                ImGui::PushTextWrapPos(); ImGui::TextColored(c, "%s", l.text.c_str()); ImGui::PopTextWrapPos();
             }
-            ImGui::BeginChild("##details", ImVec2(-1, -1), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
-            ImGuiListClipper clip;
-            clip.Begin((int)log.size());
-            while (clip.Step())
-                for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
-                    const LogLine &l = log[(size_t)i];
-                    ImVec4 c = l.kind == 1 ? ImVec4(0.55f, 0.78f, 1, 1) : l.kind == 2 ? ImVec4(1, 0.45f, 0.4f, 1)
-                             : l.kind == 3 ? ImVec4(0.45f, 0.85f, 0.55f, 1) : ImVec4(0.82f, 0.82f, 0.82f, 1);
-                    ImGui::TextColored(c, "%s", l.text.c_str());
-                }
             if (follow && busy) ImGui::SetScrollHereY(1.0f);
-            ImGui::EndChild();
+        } else {
+            ImGui::TextColored(AQUA, "%s", busy ? "Current activity" : ready ? "Ready to play" : "Next step");
+            if (busy && !status.empty()) ImGui::TextWrapped("%s", status.c_str());
+            else if (ready) ImGui::TextWrapped("%s", summary.c_str());
+            else ImGui::TextWrapped("%s", headline.c_str());
+            if (g_checking) ImGui::TextDisabled("Checking for updates...");
+            else if (!rel.ok && !g_dev) ImGui::TextWrapped("Update check: %s", rel.why.c_str());
+            if (need_update) ImGui::TextColored(GOLD, "Release %s is available.", version_label(rel.version).c_str());
         }
+        if (!g_notice.empty()) ImGui::TextWrapped("%s", g_notice.c_str());
+        if (!error.empty()) ImGui::TextColored(ImVec4(1, 0.48f, 0.40f, 1), "%s", error.c_str());
+        if (!play_error.empty()) ImGui::TextColored(ImVec4(1, 0.48f, 0.40f, 1), "%s", play_error.c_str());
+        if (ready && !stale.empty()) ImGui::TextWrapped("Shader cache note: %s", stale.c_str());
+        ImGui::EndChild();
+        if (log_font) ImGui::PopFont();
+        ImGui::PopStyleColor(); ImGui::PopStyleVar();
+
+        ImGui::SetCursorPos(ImVec2(78 * sx, 873 * sy));
+        if (step_font) ImGui::PushFont(step_font);
+        ImGui::PushStyleColor(ImGuiCol_CheckMark, AQUA);
+        ImGui::Checkbox("SHOW DETAILS", &show_details);
+        ImGui::PopStyleColor();
+        if (step_font) ImGui::PopFont();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the detailed build and shader log");
+        if (skin_button("OPEN LOGS FOLDER", "##open-logs", 350, 865, 270, 58, sx, sy, true, serif, 20)) {
+            CreateDirectoryW(widen(g_paths.logs()).c_str(), NULL); open_folder(g_paths.logs());
+        }
+        if (skin_button("OPEN DATA FOLDER", "##open-data", 650, 865, 266, 58, sx, sy, true, serif, 20)) open_folder(g_paths.data);
         ImGui::End();
+        ImGui::PopStyleVar();
         ImGui::Render();
         SDL_SetRenderDrawColor(ren, 19, 22, 26, 255);
         SDL_RenderClear(ren);
@@ -1773,6 +1993,8 @@ int main(int argc, char **argv) {
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
+    if (g_launcher_logo) SDL_DestroyTexture(g_launcher_logo);
+    if (g_launcher_skin) SDL_DestroyTexture(g_launcher_skin);
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();

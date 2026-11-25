@@ -33,6 +33,8 @@ static void dyn_update(double now, double gpu_ms) {
     if (gpu_ms >= 0) { g_dyn_gpu_sum += gpu_ms; g_dyn_gpu_n++; }
     if (g_dyn_n < 30) return;  // decide every ~half second
     double avg_dt = g_dyn_dt_sum / g_dyn_n, avg_gpu = g_dyn_gpu_n ? g_dyn_gpu_sum / g_dyn_gpu_n : -1;
+    static int nlog;  // (verbose: what each half-second decision saw - why the scale did or didn't move)
+    if (nlog++ < 2000) LOG_VERBOSE("[dynres] factor %.2f: frame %.1f ms over %d frames, gpu %.1f ms\n", g_dyn, avg_dt, g_dyn_n, avg_gpu);
     g_dyn_dt_sum = g_dyn_gpu_sum = 0;
     g_dyn_n = g_dyn_gpu_n = 0;
     if (now < g_dyn_cool_until) return;

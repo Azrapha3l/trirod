@@ -62,7 +62,7 @@ $newLauncher = Join-Path $root "$newBuild\Trirod-Launcher.exe"
 # An installation like a release unpacks to (the allowlist of setup/make_release.ps1), at a given version
 function New-Package([string]$dest, [string]$version, [string]$launcher) {
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    foreach ($n in @('trbuild.exe', 'Trirod-ShaderPrep.exe', 'trirod.ico', 'icon.png', 'tools')) {
+    foreach ($n in @('trbuild.exe', 'Trirod-ShaderPrep.exe', 'trirod.ico', 'icon.png', 'launcher-skin.png', 'tools')) {
         Copy-Item -LiteralPath (Join-Path $pkg $n) -Destination $dest -Recurse
     }
     Copy-Item -LiteralPath $launcher -Destination (Join-Path $dest 'Trirod-Launcher.exe')

@@ -17,6 +17,7 @@
 #include "../renderer.h"
 #include "../../settings.h"
 #include "prep.h"
+#include "variant_fallback.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_gstore_waits;  // (gstore_sync_cbufs)
@@ -752,10 +753,23 @@ static void run_translate_q(void (*fn)(void *), void *arg, bool low) {
 static void run_translate(void (*fn)(void *), void *arg) { run_translate_q(fn, arg, false); }
 
 static void start_workers(void) {
-    // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
-    int n = SDL_GetNumLogicalCPUCores() - 4;
+    // First entry into an area builds dozens of pipelines at once. Keep the existing
+    // default, but allow runtime A/B testing: Vulkan drivers may already parallelize
+    // pipeline compilation internally, so more host workers are not always faster.
+    int cores = SDL_GetNumLogicalCPUCores();
+    int n = cores - 4;
     if (n < 4) n = 4;
     if (n > 16) n = 16;
+    const char *setting = getenv("EOWRECOMP_VK_WORKERS");
+    if (setting && *setting) {
+        char *end = NULL;
+        long requested = strtol(setting, &end, 10);
+        if (end != setting && !*end && requested >= 1 && requested <= 32)
+            n = (int)requested;
+        else
+            LOG("[vk] ignoring invalid EOWRECOMP_VK_WORKERS='%s' (use 1..32)\n", setting);
+    }
+    LOG("[vk] shader/pipeline workers: %d (logical CPUs: %d)\n", n, cores);
     for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
 }
 static void run_job_q(void (*fn)(void *), void *arg, int tier) {
@@ -1380,7 +1394,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 
 // ================================================================== programs
 #define MAX_BIND 96
-typedef struct {
+typedef struct Prog {
     ShaderInfo *vi, *fi;
     uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
     uint64_t source_key, source_hash[2];  // stable identity for disk pipeline recipes
@@ -1397,6 +1411,8 @@ typedef struct {
     VkPipeline gpl_pre, gpl_frag; // reusable shader libraries when VK_EXT_graphics_pipeline_library is available
     bool vs_uses_vid;
     _Atomic int state;  // 0 building, 1 ready, 2 failed
+    struct Prog *family_next;  // other variants of the same guest code (variant_family_*)
+    bool fallback_open;        // (render thread) a draw of this variant used a stand-in; not yet drawn by itself
 } Prog;
 
 static uint64_t glsl_source_hash(const char *src, int stage) {
@@ -1550,8 +1566,11 @@ static uint64_t stat_warm_prog_hits, stat_warm_pipe_hits, stat_new_pipes;
 // recipe and already ready, or still building; or not in the recipes at all (missed: a new build, recorded for the
 // next preparation). Driver side, from VK_PIPELINE_CREATION_FEEDBACK (core 1.3): each vkCreateGraphicsPipelines that
 // came out of the pipeline cache (prepared by Setup or saved by an earlier run) or had to be compiled.
+// Variant fallbacks (variant_fallback.h): draws made with a built variant of the same guest code while theirs was still
+// building, how often a variant started / stopped needing one, and the stand-ins' own pipelines.
 static struct {
     uint64_t reused_ready, reused_building, missed, prog_reused, prog_missed;
+    uint64_t fb_draws, fb_started, fb_replaced, fb_pipes;
     _Atomic uint64_t cache_hit, compiled, linked, lib_hit, lib_compiled;
 } sess;
 
@@ -1580,12 +1599,14 @@ void vk_pipeline_session_summary(char *out, size_t n) {
     vk_warm_summary(&w);
     snprintf(out, n, "pipelines: %d prepared from recipes (%d built); first draws: %llu reused ready, %llu reused still "
              "building, %llu missed (new); programs %llu reused, %llu new; driver: %llu from cache, %llu compiled, %llu "
-             "fast-linked; stage libraries %llu from cache, %llu compiled",
+             "fast-linked; stage libraries %llu from cache, %llu compiled; variant fallbacks: %llu draws, %llu started, "
+             "%llu replaced by the exact variant, %llu stand-in pipelines",
              w.pipelines, w.pipelines_ok, (unsigned long long)sess.reused_ready, (unsigned long long)sess.reused_building,
              (unsigned long long)sess.missed, (unsigned long long)sess.prog_reused, (unsigned long long)sess.prog_missed,
              (unsigned long long)atomic_load(&sess.cache_hit), (unsigned long long)atomic_load(&sess.compiled),
              (unsigned long long)atomic_load(&sess.linked), (unsigned long long)atomic_load(&sess.lib_hit),
-             (unsigned long long)atomic_load(&sess.lib_compiled));
+             (unsigned long long)atomic_load(&sess.lib_compiled), (unsigned long long)sess.fb_draws,
+             (unsigned long long)sess.fb_started, (unsigned long long)sess.fb_replaced, (unsigned long long)sess.fb_pipes);
 }
 
 static void compile_program(void *arg) {
@@ -1679,6 +1700,66 @@ static void translate_program(void *arg) {
 #define PROG_TAB 4096
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
+// ---- variant families: every program variant of the same guest VS + FS code (code ids, not addresses), for the
+// stand-in draws of variant_fallback.h. Added by get_program and the warmup (warm_prog_get, UI thread at start).
+#define FAMILY_TAB 4096
+static struct { uint64_t key; Prog *head; } family_tab[FAMILY_TAB];
+static int family_count;
+static pthread_mutex_t family_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t family_key(const uint64_t gid[2], const uint32_t gext[2]) {
+    uint64_t w[3] = {gid[0], gid[1], (uint64_t)gext[0] | (uint64_t)gext[1] << 32}, h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < sizeof w; i++) { h ^= ((const uint8_t *)w)[i]; h *= 0x100000001B3ull; }
+    return h ? h : 1;
+}
+
+static void variant_family_add(Prog *p) {
+    if (!p->gid[0] || !p->gid[1]) return;  // (unknown code identity: never a stand-in, never stood in for)
+    uint64_t key = family_key(p->gid, p->gext);
+    pthread_mutex_lock(&family_lock);
+    uint32_t i = (uint32_t)(key ^ (key >> 29)) & (FAMILY_TAB - 1);
+    while (family_tab[i].key && family_tab[i].key != key) i = (i + 1) & (FAMILY_TAB - 1);
+    if (family_tab[i].key || family_count < FAMILY_TAB / 2) {  // (a full table: the program just has no family)
+        if (!family_tab[i].key) family_tab[i].key = key, family_count++;
+        p->family_next = family_tab[i].head;
+        family_tab[i].head = p;
+    }
+    pthread_mutex_unlock(&family_lock);
+}
+
+static bool fallback_on(void) {
+    static int on = -1;  // EOWRECOMP_VK_VARIANT_FALLBACK=0: skip / wait for every variant still building, as before
+    if (on < 0) on = !(getenv("EOWRECOMP_VK_VARIANT_FALLBACK") && atoi(getenv("EOWRECOMP_VK_VARIANT_FALLBACK")) == 0);
+    return on;
+}
+
+// Built variants of `want`'s guest code that may draw for it with these keys (vf_check), newest first; `skip` is left
+// out. Only ready programs (state 1, so vi / fi are final).
+static int variant_fallbacks(const Prog *want, const ShaderKey *vkey, const ShaderKey *fkey, const Prog *skip,
+                             Prog **out, int max) {
+    if (!fallback_on() || !want->gid[0] || !want->gid[1]) return 0;
+    VfVariant w = {.gid = {want->gid[0], want->gid[1]}, .gext = {want->gext[0], want->gext[1]}, .vkey = *vkey, .fkey = *fkey};
+    uint64_t key = family_key(want->gid, want->gext);
+    int n = 0;
+    pthread_mutex_lock(&family_lock);
+    uint32_t i = (uint32_t)(key ^ (key >> 29)) & (FAMILY_TAB - 1);
+    while (family_tab[i].key && family_tab[i].key != key) i = (i + 1) & (FAMILY_TAB - 1);
+    for (Prog *c = family_tab[i].key ? family_tab[i].head : NULL; c && n < max; c = c->family_next) {
+        if (c == want || c == skip || atomic_load(&c->state) != 1) continue;
+        VfVariant cv = {.gid = {c->gid[0], c->gid[1]}, .gext = {c->gext[0], c->gext[1]}, .vkey = c->vkey, .fkey = c->fkey};
+        VfVerdict v = vf_check(&w, &cv, c->vi->attr_mask, c->fi->out_mask);
+        if (v == VF_OK) out[n++] = c;
+        else {
+            static int nlog;
+            if (nlog++ < 16)
+                LOG_VERBOSE("[vk] variant fallback: built sibling of vs=%016llx fs=%016llx rejected (%s)\n",
+                    (unsigned long long)want->gid[0], (unsigned long long)want->gid[1], vf_verdict_names[v]);
+        }
+    }
+    pthread_mutex_unlock(&family_lock);
+    return n;
+}
+
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -1716,6 +1797,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
+    variant_family_add(p);
     run_translate(translate_program, p);
     return p;
 }
@@ -1912,6 +1994,7 @@ typedef struct {
     VkPipeline pipe, optimized, gpl_vi, gpl_fo;
     _Atomic int state, optimized_state;
     bool warm;
+    bool stand_in;  // a variant fallback's pipeline (draw_): temporary, so no optimized replacement
 } Pipe;  // state: 0 building, 1 ready, 2 failed
 #define PIPE_TAB 65536
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
@@ -2073,7 +2156,7 @@ static void build_pipeline_mode(Pipe *pp, bool optimize) {
             atomic_store(&pp->state, 1);
             static int lto = -1;  // EOWRECOMP_VK_GPL_OPTIMIZE=0: keep the fast-linked pipeline (no optimized replacement)
             if (lto < 0) lto = !(getenv("EOWRECOMP_VK_GPL_OPTIMIZE") && atoi(getenv("EOWRECOMP_VK_GPL_OPTIMIZE")) == 0);
-            if (lto) atomic_fetch_add(&gpl_opt_queued, 1), run_job_q(optimize_gpl_pipeline, pp, 2);
+            if (lto && !pp->stand_in) atomic_fetch_add(&gpl_opt_queued, 1), run_job_q(optimize_gpl_pipeline, pp, 2);
             if (pp->warm) { extern void warm_pipe_done(bool ok); warm_pipe_done(true); }
             return;
         }
@@ -2545,6 +2628,7 @@ static Prog *warm_prog_get(const uint64_t gid[2], const uint32_t gext[2], const 
     warm_progs[i].key = key;
     warm_progs[i].p = p;
     warm_nprogs++;
+    variant_family_add(p);
     return p;
 }
 
@@ -4630,15 +4714,21 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
-    Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || (atomic_load(&pr->state) != 1 && !compile_wait(r, indexed, &pr->state, pr, NULL))) {
+    // `want` is the exact variant for this draw's keys; `pr` draws. While `want` is still building, a built variant of
+    // the same guest code whose translation is identical for these keys stands in (variant_fallback.h) instead of a
+    // skip or a wait. Its own pipeline for this draw's state is built (or found) below. Every draw looks `want` up
+    // again, so the first draw after it is ready uses it.
+    Prog *want = get_program(st.program, &vkey, &fkey), *pr = want, *stand_in[8];
+    if (want && atomic_load(&want->state) == 0 && variant_fallbacks(want, &vkey, &fkey, NULL, stand_in, 1)) pr = stand_in[0];
+    else if (!pr || (atomic_load(&pr->state) != 1 && !compile_wait(r, indexed, &pr->state, pr, NULL))) {
         SKIP(pr && atomic_load(&pr->state) != 2 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED);  // (it may just have become ready)
         return;
     }
-    fkey.stencil_tex = stencil_texture_slots(1, pr->fi);
+    fkey.stencil_tex = stencil_texture_slots(1, pr->fi);  // (same texture list for every variant of the FS code)
     if (fkey.stencil_tex) {
-        pr = get_program(st.program, &vkey, &fkey);
-        if (!pr || (atomic_load(&pr->state) != 1 && !compile_wait(r, indexed, &pr->state, pr, NULL))) {
+        want = pr = get_program(st.program, &vkey, &fkey);
+        if (want && atomic_load(&want->state) == 0 && variant_fallbacks(want, &vkey, &fkey, NULL, stand_in, 1)) pr = stand_in[0];
+        else if (!pr || (atomic_load(&pr->state) != 1 && !compile_wait(r, indexed, &pr->state, pr, NULL))) {
             SKIP(pr && atomic_load(&pr->state) != 2 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED);
             return;
         }
@@ -4778,22 +4868,67 @@ static void draw_(CmdRec *r, bool indexed) {
         pp = warm_pipe_find(ph);  // built (or being built) by the startup warmup from a recipe of an earlier run
         if (pp) {
             stat_warm_pipe_hits++;
-            if (atomic_load(&pp->state) == 1) sess.reused_ready++;
-            else sess.reused_building++;
+            if (pr == want && atomic_load(&pp->state) == 1) sess.reused_ready++;
+            else if (pr == want) sess.reused_building++;
         } else {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
-            run_job(build_pipeline, pp);
-            recipe_note(pr, &k);  // (for the next start's warmup)
-            stat_new_pipes++;
-            sess.missed++;
+            if (pr != want) {
+                // A stand-in program's pipeline for this draw's own state (formats, vertex layout, blend: all of k but
+                // the program). Temporary: no recipe (the exact variant's is recorded once it draws), no optimized
+                // replacement; at the front of the queue - with shader-stage libraries it is a fast link.
+                pp->stand_in = true;
+                run_job(build_pipeline, pp);
+                jobs_bump(&jobs, pp);
+                sess.fb_pipes++;
+            } else {
+                run_job(build_pipeline, pp);
+                recipe_note(pr, &k);  // (for the next start's warmup)
+                stat_new_pipes++;
+                sess.missed++;
+            }
         }
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
     }
+    if (atomic_load(&pp->state) == 0) {
+        // Still building: a ready pipeline of another built variant that may stand in (variant_fallback.h), for exactly
+        // this state - only the program in the key differs, and attr_mask / write_mask come from the same guest code.
+        // Looked up, never built here (the exact pipeline already is).
+        int n = variant_fallbacks(want, &vkey, &fkey, pr, stand_in, 8);
+        for (int i = 0; i < n; i++) {
+            PipeKey sk = k;
+            sk.prog = stand_in[i];
+            uint64_t sh = hash_words(0xcbf29ce484222325ull, &sk, sizeof sk);
+            if (!sh) sh = 1;
+            uint32_t s = (uint32_t)(sh ^ (sh >> 29)) & (PIPE_TAB - 1);
+            while (pipe_tab[s].key && pipe_tab[s].key != sh) s = (s + 1) & (PIPE_TAB - 1);
+            Pipe *alt = pipe_tab[s].key ? pipe_tab[s].pipe : warm_pipe_find(sh);
+            if (alt && atomic_load(&alt->state) == 1) { pr = stand_in[i]; pp = alt; break; }
+        }
+    }
     if (atomic_load(&pp->state) != 1 && !compile_wait(r, indexed, &pp->state, NULL, pp)) {
         SKIP(atomic_load(&pp->state) != 2 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED);  // (it may just have become ready)
         return;
+    }
+    if (pr != want) {
+        sess.fb_draws++;
+        if (!want->fallback_open) {
+            want->fallback_open = true;
+            sess.fb_started++;
+            static int nlog;
+            if (nlog++ < 64)
+                LOG_VERBOSE("[vk] variant fallback: vs=%016llx fs=%016llx drawn with a built variant while its own %s builds\n",
+                    (unsigned long long)want->gid[0], (unsigned long long)want->gid[1],
+                    atomic_load(&want->state) == 1 ? "pipeline" : "program");
+        }
+    } else if (want->fallback_open) {
+        want->fallback_open = false;
+        sess.fb_replaced++;
+        static int nlog;
+        if (nlog++ < 64)
+            LOG_VERBOSE("[vk] variant fallback: vs=%016llx fs=%016llx replaced by the exact variant\n",
+                (unsigned long long)want->gid[0], (unsigned long long)want->gid[1]);
     }
     {   // (compile_wait: a target drawn in the previous frame is redrawn next frame; one that wasn't may not be)
         extern uint64_t vk_frame_counter(void);

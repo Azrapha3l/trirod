@@ -42,7 +42,7 @@ if (Test-Path -LiteralPath $outVersion) { Remove-Item -LiteralPath $outVersion -
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 # Only the installation's own files (an allowlist), never the data a development run left beside them
-$top = @('Trirod-Launcher.exe', 'trbuild.exe', 'Trirod-ShaderPrep.exe', 'trirod.ico', 'icon.png', 'tools')
+$top = @('Trirod-Launcher.exe', 'trbuild.exe', 'Trirod-ShaderPrep.exe', 'trirod.ico', 'icon.png', 'launcher-skin.png', 'tools')
 foreach ($name in $top) {
     $from = Join-Path $pkg $name
     if (-not (Test-Path -LiteralPath $from)) { throw "The package has no $name." }

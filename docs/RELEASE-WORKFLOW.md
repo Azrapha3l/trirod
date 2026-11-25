@@ -193,6 +193,10 @@ does with pipeline keys seen in play and Triforce with its precompile at start.
 - Optimized replacements of fast-linked pipelines run on an idle tier, so they never delay this build or any draw.
 
 **When a draw meets something still building:**
+- If another variant of the same guest shader code is already built, and the translator gives it the same output for
+  this draw's keys, that variant draws instead, with a pipeline for this draw's own state. The draw's own variant keeps
+  building and takes over as soon as it is ready. The rules are in `runtime/nvn/vulkan/variant_fallback.h`;
+  `EOWRECOMP_VK_VARIANT_FALLBACK=0` turns this off.
 - A draw into a target that nothing drew into last frame (a one-shot pass) waits for its build, within the
   per-frame budget, instead of being skipped. This is TOTK's rule.
 - A compute dispatch waits up to 250 ms.
@@ -201,6 +205,8 @@ does with pipeline keys seen in play and Triforce with its precompile at start.
 Each session logs `[vk] session pipelines: ...` at exit (and every 30 s with verbose output on). It gives:
 - how many were prepared from recipes;
 - first draws that reused a ready or still-building pipeline, and first draws that missed (new);
+- variant fallbacks: draws made by a built variant, variants that started and stopped needing one, and the stand-ins'
+  own pipelines;
 - programs reused and new;
 - driver cache hits, compiles and fast links (from `VK_PIPELINE_CREATION_FEEDBACK`).
 

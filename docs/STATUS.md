@@ -2,6 +2,132 @@
 
 Atualizado: 2026-11-24 (GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
 
+## Dynamic resolution lattice (2026-11-25): light grid scaled below 1x; fixed (Vulkan), tested in game, not committed
+
+- **Seen:** a dark lattice of tile-sized blocks over walls and floors, with stair-stepped edges and smeared floor
+  blocks. It shows from the first cutscene (2-5 s in) and in the torch corridors of the prologue.
+- **Cause (reproduced):** any internal resolution below 1x, not the resolution change itself.
+  - Dynamic gets there because cold-start frames are slow: 1.00 -> 0.50 within the first seconds, `[dynres]` lines.
+  - Match display in a window smaller than 1920x1080 also renders below 1x. In a 1280x720 window it renders at
+    0.667x, and the lattice shows at frame 60, before any change. 75% / 50% / 25% should show it too (not run).
+  - The game draws light volumes into small 16:9 render targets, 64x36 and 128x72 (fmt 0x25; fs `72a46dd400` /
+    `72a46e1400`): a per-tile light grid, one texel per screen tile. `textures.c` `tex_scalable` treats any 16:9
+    render target of at least 32x16 as an image and scaled them: 64x36 became 43x24, with viewport 42.67x24
+    (`EOWRECOMP_DEBUG_FRAME` draw log).
+  - Below one pixel per tile, whole tile rows and columns are never rasterized. The geometry pass then reads missing
+    or neighbouring tiles. The per-pass dump shows the lattice already in the geometry pass (pass 67 of frame 120),
+    before any post-processing.
+  - At 1x and above every tile keeps a pixel: clean at 1x.
+- **Not involved** (controlled runs, one condition changed at a time, cold cache, fresh save):
+  - Shader builds: the lattice is the same with a warm cache.
+  - The resolution change itself: it is there at a constant 0.667x.
+  - Validation: no new messages; only the known "FS writes c0 with no color attachment" warning.
+  - Separately, a cold cache can still draw plants black for about 1 s while one long translation job is queued: a
+    skipped draw after the 500 ms hold. That is a shader-build artifact, unrelated to resolution.
+  - The quoted `[tex] new render-target image ... covers the same guest memory` line doesn't exist in this source.
+- **Fix:** `textures.c` `target_scale`. Scalable targets narrower than 256 guest pixels are never allocated below
+  their guest size; larger targets still follow the scale, so Dynamic keeps its savings. Shaders read every texture
+  through its own scale (rscale table) and passes take their viewport scale from their own target, so mixed scales
+  are consistent.
+  - Metal (`metal.m`) has the same allocation rule and very likely the same bug: not changed, not tested.
+- **New diagnostics (verbose only):**
+  - `[dynres] factor ...`: what each half-second decision measured.
+  - `[vk] render target reallocated for scale ...`: tex, guest size, format, address, old -> new size, frame.
+- **Tested** (Vulkan, GPL on; `<test-install>` v1.1.0; scratch `EOWRECOMP_CACHE_DIR`, `EOWRECOMP_SAVE_DIR`,
+  `EOWRECOMP_SETTINGS`, so the install's cache, save and settings are untouched; 1280x720 window):
+
+  | Run | Scale | Lattice |
+  |---|---|---|
+  | before, Dynamic, cold | 0.667 -> 0.333 (factor 1.0 -> 0.5) | yes, from frame 60 |
+  | before, Match, cold (CRLF settings run, see below) | 0.667 | yes (torch walls) |
+  | before, 1x, cold | 1.0 | no |
+  | fix, Dynamic, cold, start + prologue route to the first fight | 28 changes | no |
+  | fix, Dynamic, warm (same route's cache) | 0.667 | no |
+  | fix, Dynamic, cold, `EOWRECOMP_VK_VALIDATION=1` | changing | no; same messages as before |
+
+  `./setup/build.ps1` passes, with no warnings in the changed files.
+- **Not tested:** fullscreen (the user's setup; Dynamic starts from the display size); upward scale steps above 1x with
+  non-integer factors (a tile could map to a neighbouring texel: a hypothesis, nothing seen); Metal.
+- **CRLF settings files (found while testing, fixed):**
+  - On Windows the game opens every file in binary mode (`platform/windows.c` sets `_fmode = _O_BINARY`), so
+    `settings_load` kept the `\r` of CRLF lines.
+  - With a CRLF file, every value missed its match and silently fell back to its default: `resolution = dynamic`
+    became Match display, `frame_rate = 60` the game's 30, and the `gpu` id was dropped. Notepad and PowerShell's
+    `Set-Content` write CRLF.
+  - Fix: the value now ends at a CR too (`settings.c`); control bindings go through the same line.
+  - Test: `tools/test_settings.c` now uses binary mode like the game and loads the round-trip file rewritten with
+    CRLF. It passes with the fix and fails on the old parser (the gpu id is lost).
+  - In game (`<test-install>`, scratch CRLF settings file with `resolution = dynamic`): `[dynres]` decisions and scale
+    changes from the start. The same CRLF file before the fix gave none (it ran at Match display).
+  - The runtime's other line readers already strip `\r\n` or stop at whitespace.
+- **For the user to check:** fullscreen, Dynamic, a new game from a cold cache. Expected: no lattice in the opening
+  cutscene and prologue. With `--console`, the `[dynres]` lines show the scale going below 1.
+
+## Shader variant fallback (2026-11-25): stand-in draws while a variant builds; tested in game on a cold cache, not committed
+
+- **What it does.** A guest program (VS + FS) is translated once per `ShaderKey` pair. The first draw of each new
+  variant (other vertex formats, target formats or stencil views) was skipped, or waited, until the translator,
+  glslang and the pipeline were done. Now `draw_` (`exec.c`) lets an already built variant of the **same guest code**
+  draw in its place when the translator gives both keys identical output. The stand-in's pipeline is built for this
+  draw's own state: formats, vertex layout, blend, depth/stencil. The exact variant keeps building, and every draw
+  looks it up again, so it takes over at the first draw after it is ready.
+  - Program still building: the first ready, compatible sibling draws. If its pipeline for this state doesn't exist,
+    it is queued at the front with no recipe and no optimized replacement (a fast link with GPL).
+  - Program ready, pipeline still building: a compatible sibling's pipeline for exactly this state is used if it
+    is already ready. Nothing is built for this case.
+  - Nothing compatible and ready: the previous behaviour (one-shot / full-screen wait, otherwise skip and hold).
+- **Compatibility rules** (`runtime/nvn/vulkan/variant_fallback.h` `vf_check`, from every key read in
+  `translate.c`):
+  - same guest VS and FS code ids and extents (content hashes, not addresses; id 0 = unknown = never);
+  - equal `glsl`, `flip_y`, `flip_x`, `depth_minus_one` in both keys;
+  - equal `attr_kind` for every attribute the VS reads (its `attr_mask`); unread ones may differ;
+  - equal `rt_kind` for every target the FS writes (its `out_mask`; tint only when target 0 is written); unwritten
+    ones may differ;
+  - equal `stencil_tex`;
+  - FS `vs_out_mask` ignored: the translation sets it from the VS code, and a stand-in's own VS feeds its own FS;
+  - every other field must be equal.
+- **Counters:** the `[vk] session pipelines` line ends with "variant fallbacks: N draws, N started, N replaced by
+  the exact variant, N stand-in pipelines". With verbose output, the first 64 starts and replacements are logged, and
+  the first 16 rejected siblings with the rule that rejected them. `EOWRECOMP_VK_VARIANT_FALLBACK=0` turns it off.
+  The pipeline cache format is unchanged (no `PIPELINE_SCHEME` bump).
+- **Tests:** `tools/test_variant_fallback.sh` (`tools/test_variant_fallback.c`, CPU only), 1822 checks, all pass:
+  - 36 directed cases, including every reject;
+  - 20000 fuzzed programs (7601 translatable pairs): each accepted stand-in (1784, 1341 with other keys) translates
+    byte-identically to the exact variant, ShaderInfo included.
+  - With the attribute or target rule removed, it fails (27 and 1037 failures).
+- **Built:** `./setup/build.ps1` passes, with no warnings in `exec.c`. `Trirod.exe` relinked into `<test-install>`
+  with `trbuild code` (game code reused).
+- **In game** (`<test-install>`, v1.1.0, scripted save load, `EOWRECOMP_CACHE_DIR` pointing at an empty scratch
+  folder, so a first-run session; verbose):
+
+  | Run | Stand-in draws | Variants started / replaced | Stand-in pipelines | Skipped at the load |
+  |---|---|---|---|---|
+  | fallback on (GPL) | 35 | 8 / 8 | 1 | 101 (46 program, 55 pipeline) |
+  | `EOWRECOMP_VK_VARIANT_FALLBACK=0` | 0 | 0 / 0 | 0 | 109 (47 program, 62 pipeline) |
+  | on, `EOWRECOMP_VK_GPL=0` | 34 | 8 / 8 | 1 | 123 (46 program, 77 pipeline) |
+
+  - One sibling was rejected in game for a read vertex input of another kind.
+  - Scene after the load: correct (screenshot at frame 4500).
+  - With the prepared cache, nothing needed a stand-in (0 skipped, 0 missed).
+  - `EOWRECOMP_VK_VALIDATION=1`: the same messages with the fallback on and off (the known "FS writes c0 with no
+    color attachment" depth pre-pass warning, 10 times). The "on" run also hit a validation-layer timeline-semaphore
+    timeout and then an exception inside the layer, about 100 s after the last fallback event. It has not been seen
+    again and has not been traced.
+- **Limits, where a draw can still be skipped:**
+  - the first variant of a guest program (no sibling exists);
+  - siblings still building, or failed;
+  - a sibling that differs in a read vertex input kind, a written target kind, stencil samplers or clip-space flags;
+  - code ids unknown (`EOWRECOMP_VK_WARM=0`);
+  - a stand-in whose own pipeline for this state is not built yet (skips like before, or waits under the one-shot
+    rule);
+  - pipeline still building for a ready program while no sibling has a ready pipeline for that exact state.
+  - Compute dispatches are unchanged.
+  - Most of the load's skips are still first variants: in this scene the fallback covered 8 of 62 programs.
+- **For the user to check:** play an area not yet in the prepared cache (or use an empty `EOWRECOMP_CACHE_DIR`), and
+  look for fewer missing objects during the first seconds. Run with `--console` and check the "variant fallbacks"
+  part of `[vk] session pipelines`. If something looks wrong only while shaders build, compare with
+  `EOWRECOMP_VK_VARIANT_FALLBACK=0`.
+
 ## Launcher self-update (2026-11-25): staged install + restart, tested end to end locally, not against a GitHub release
 
 - **Root cause (traced in `launcher_win.cpp`):**

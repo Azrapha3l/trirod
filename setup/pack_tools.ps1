@@ -146,7 +146,8 @@ foreach ($name in $runtimeDlls) {
 Get-ChildItem -LiteralPath (Join-Path $root 'build\win\deps\ffmpeg\bin') -Filter '*.dll' -File |
     Copy-Item -Destination $out -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\trirod.ico') -Destination (Join-Path $out 'trirod.ico') -Force
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\trirod-staff.png') -Destination (Join-Path $out 'icon.png') -Force
+Copy-Item -LiteralPath (Join-Path $root 'docs\icon\icon_1024.png') -Destination (Join-Path $out 'icon.png') -Force
+Copy-Item -LiteralPath (Join-Path $root 'runtime\launcher\assets\launcher-skin.png') -Destination (Join-Path $out 'launcher-skin.png') -Force
 # Files of the old Setup that the new launcher no longer uses
 foreach ($old in @('Tools.zip', 'eowsetup.exe', 'eowgame.dll', 'eowgame.dll.id')) {
     Remove-Item -LiteralPath (Join-Path $out $old) -Force -ErrorAction SilentlyContinue

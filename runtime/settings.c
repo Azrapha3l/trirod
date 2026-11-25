@@ -95,7 +95,9 @@ void settings_load(void) {
     while (fgets(line, sizeof line, f)) {
         char key[64];
         char val[128];
-        if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 1) continue;
+        // (the value ends at a CR too: a file saved with CRLF - Notepad, PowerShell's Set-Content - kept "dynamic\r",
+        // which matched no choice, and the option silently fell back to its default; 2026-11-25)
+        if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "gpu")) {

@@ -60,6 +60,9 @@ implementado mas nunca foi testado contra uma release publicada; não o descreva
   (`--data <pasta>` para testes, `--recompile` para começar a build sozinho). Não redirecionar a saída do script em
   Windows PowerShell 5.1: o stderr do PyInstaller vira erro com `$ErrorActionPreference = 'Stop'`.
 - Medir em vez de estimar (rodar as ferramentas: `tools/nso.py`, `tools/analyze.py --census`, logs).
+- Mudança em escala ou render targets: testar também abaixo de 1x (Dynamic, ou Match display numa janela menor que
+  1920x1080), não só 1x/2x (a grade de luz 64x36 do jogo quebrava abaixo de 1x). Testes no jogo usam
+  `EOWRECOMP_CACHE_DIR`, `EOWRECOMP_SAVE_DIR` e `EOWRECOMP_SETTINGS` em pastas de rascunho.
 - Avançar por marcos (M1…M7, `docs/STATUS.md`); só passar ao próximo com o atual comprovado.
 
 ## Git

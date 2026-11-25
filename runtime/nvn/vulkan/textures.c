@@ -182,6 +182,25 @@ static bool tex_scalable(const NvnTexture *t) {
     return a > 1.74f && a < 1.81f;
 }
 
+// The allocation scale of a scalable target. Small targets are never allocated below their guest size: the game
+// renders per-tile data into some of them - its light grid, 64x36 and 128x72 texels drawn with light volumes (fs
+// 72a46dd400 / 72a46e1400), one texel per screen tile, read back per tile by the scene's material shaders. Below 1x
+// (Dynamic resolution's lower steps, 75% / 50% / 25%, Match display in a window smaller than 1920x1080) a 64-tile
+// grid got 43 texels: whole rows and columns of tiles were never rasterized, and the scene was lit from missing or
+// neighbouring tiles - a dark lattice over walls and floors, stair-stepped at the tile edges (2026-11-25, opening
+// cutscene at 0.667x; clean at 1x). At 1x and above every tile keeps at least a texel. Images this small cost
+// nothing to keep at full size, and shaders read every texture through its own scale (the rscale table), so a
+// target kept at 1x while the rest of the frame is scaled down is read correctly.
+#define SCALE_FLOOR_BELOW_W 256
+static void target_scale(const NvnTexture *t, float *sx, float *sy) {
+    *sx = g_rs_x;
+    *sy = g_rs_y;
+    if (t->width < SCALE_FLOOR_BELOW_W) {
+        if (*sx < 1) *sx = 1;
+        if (*sy < 1) *sy = 1;
+    }
+}
+
 bool renderer_texture_first_write(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     uint64_t total_frames = renderer_present_count();
@@ -263,8 +282,10 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    float tsx = 1, tsy = 1;
+    if (b->scalable) target_scale(t, &tsx, &tsy);
+    b->sx = tsx;
+    b->sy = tsy;
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -402,9 +423,17 @@ static void live_remove(TexBackend *b) {
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        float tsx = 1, tsy = 1;
+        if (b->scalable) target_scale(t, &tsx, &tsy);
+        if (b->scalable && (b->sx != tsx || b->sy != tsy)) {  // output resolution changed: reallocate
+            uint32_t ow = b->width, oh = b->height;
             destroy_image(b);
             create_image(t, b);
+            static int nlog;  // (dynamic resolution: which targets follow a scale change, and when)
+            if (nlog++ < 400)
+                LOG_VERBOSE("[vk] render target reallocated for scale %.3f x %.3f: tex=%p guest %ux%u fmt %#x addr %llx: %ux%u -> %ux%u (frame %llu)\n",
+                    b->sx, b->sy, (void *)t, t->width, t->height, t->format, (unsigned long long)t->addr, ow, oh, b->width, b->height,
+                    (unsigned long long)renderer_present_count());
         }
         return b;
     }

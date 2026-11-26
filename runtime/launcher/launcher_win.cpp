@@ -1597,6 +1597,9 @@ static void draw_steps(const std::vector<Step> &steps) {
         std::string title = s.title;
         if (title.size() >= 3 && title[0] >= '0' && title[0] <= '9' && title[1] == '.' && title[2] == ' ')
             title.erase(0, 3);
+        int percent = s.state == StepState::Done ? 100
+                    : (int)std::lround(std::max(0.0, std::min(1.0, s.progress)) * 100.0);
+        title += " (" + std::to_string(percent) + "%)";
         ImVec4 title_color = s.state == StepState::Pending ? ImVec4(0.69f, 0.71f, 0.72f, 1) : c;
         ImGui::SetCursorScreenPos(ImVec2(icon.x + 40, icon.y + 2));
         ImGui::PushTextWrapPos();

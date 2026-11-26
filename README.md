@@ -22,7 +22,7 @@ The Windows release is distributed as a tools package. The package contains the 
 
 ### First launch
 
-1. Download `Trirod-Tools-<version>.zip` from [Trirod Releases](https://github.com/Azrapha3l/trirod/releases/latest).
+1. Download `TriRod-<version>-Windows-x64.zip` from [Trirod Releases](https://github.com/Azrapha3l/trirod/releases/latest).
 2. Extract the **entire ZIP** to a writable folder of your choice. Keep the launcher, tools, and DLLs together in that folder.
 3. Run `Trirod-Launcher.exe`.
 4. In the launcher, choose the folder containing your game files, or choose your `.xci` / `.nsp` package. If you select a package, place `prod.keys` beside it.

@@ -16,7 +16,7 @@ param(
 )
 
 # Produces the two files a Windows release carries (docs/RELEASE-WORKFLOW.md, "Maintainer release procedure"):
-#   Trirod-Tools-<version>.zip   the installation (launcher, trbuild, Trirod-ShaderPrep, runtime DLLs, tools/)
+#   TriRod-<version>-Windows-x64.zip   the installation (launcher, trbuild, Trirod-ShaderPrep, runtime DLLs, tools/)
 #   trirod-release.json          what the launcher reads: version, build identifiers, the zip's size and SHA-256
 # Nothing is uploaded: attach both files to one GitHub Release yourself. Game files and anything made from them are
 # refused (setup/check_package.ps1), and the player's data in a development installation is left out.
@@ -53,7 +53,7 @@ Get-ChildItem -LiteralPath $pkg -Filter '*.dll' -File | Where-Object { $_.Name -
 & (Join-Path $PSScriptRoot 'check_package.ps1') -PackageDir $stage
 
 # zip with Windows' own tar (bsdtar): forward-slash entry names, and the launcher unpacks with the same tool
-$zipName = "Trirod-Tools-$version.zip"
+$zipName = "TriRod-$version-Windows-x64.zip"
 $zip = Join-Path $outVersion $zipName
 $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
 $entries = Get-ChildItem -LiteralPath $stage | ForEach-Object { $_.Name }

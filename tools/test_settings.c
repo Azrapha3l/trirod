@@ -27,6 +27,8 @@ int main(void) {
     assert(settings_frame_rate_hz(FPS_MONITOR, 0) == 60);  // safe display-query fallback
     assert(settings_frame_rate_hz(-1, 144) == 0);
     assert(putenv("EOWRECOMP_SETTINGS=build/video-options-check/settings-roundtrip.ini") == 0);
+    assert(!g_settings.cheat_rupees && !g_settings.cheat_health && !g_settings.cheat_energy);
+    g_settings.cheat_rupees = g_settings.cheat_energy = true;  // (two of the three: each key is its own)
     strcpy(g_settings.gpu_id, "00112233445566778899aabbccddeeff");
     g_settings.frame_rate = FPS_210;
     g_settings.res_mode = RES_DYNAMIC;
@@ -48,11 +50,13 @@ int main(void) {
     g_settings.gpu_id[0] = 0;
     g_settings.frame_rate = FPS_GAME;
     g_settings.res_mode = RES_MATCH;
+    g_settings.cheat_rupees = g_settings.cheat_energy = false;
     settings_load();
+    assert(g_settings.cheat_rupees && !g_settings.cheat_health && g_settings.cheat_energy);
     assert(!strcmp(g_settings.gpu_id, "00112233445566778899aabbccddeeff"));
     assert(g_settings.frame_rate == FPS_210);
     assert(g_settings.res_mode == RES_DYNAMIC);
     remove("build/video-options-check/settings-roundtrip.ini");
-    puts("settings frame-rate choices, CRLF file: PASS");
+    puts("settings frame-rate choices, cheats, CRLF file: PASS");
     return 0;
 }

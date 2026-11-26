@@ -13,7 +13,7 @@ publishing an update. The progress protocol between the launcher and its tools i
 | `Trirod-ShaderPrep.exe` | `runtime/tools/shaderprep.c` linked with the same runtime objects as `Trirod.exe` | Headless shader preparation (stage *Preparing shaders for the graphics device*). It uses the runtime's Vulkan backend without a window. |
 | `Trirod.exe` | linked by `trbuild code` from `tools/link-kit/eowruntime.a` into the data folder | The game runtime. It is the only program that renders the game. |
 | `extracted/Trirod.dll` | built by `trbuild code` from the player's ExeFS | The game code, built from the player's own files. It is never distributed. |
-| `Trirod-Tools-<version>.zip` + `trirod-release.json` | `setup/make_release.ps1` | The release assets. |
+| `TriRod-<version>-Windows-x64.zip` + `trirod-release.json` | `setup/make_release.ps1` | The release assets. The manifest's `assets[].name` contains the exact ZIP filename. |
 
 Install folder layout (`setup/pack_tools.ps1` stages it; a release zip unpacks to the same layout):
 
@@ -323,7 +323,7 @@ Development builds have no `UPDATE_REPO` and never contact GitHub, even without 
    the installation's own files into a fresh stage and runs `setup/check_package.ps1`, which refuses game files,
    packages, keys, shader archives, uncurated shader data, built game code, and caches. It includes the curated
    `tools\shader_catalog\warm` records, then zips the stage with `tar.exe` and writes
-   `build\release\<version>\Trirod-Tools-<version>.zip` and `trirod-release.json`
+   `build\release\<version>\TriRod-<version>-Windows-x64.zip` and `trirod-release.json`
    (`format: "trirod-release"`, `schema: 1`, `version`, `channel: "windows-x64"`, `min_launcher`, `required`,
    `build.{gamelib_id, gamebuild_id, protocol}`, `assets[{name, kind: "tools", size, sha256}]`). It uploads nothing.
 4. Smoke-test the update path from the zip: fresh install, current install with no update, a tools update that

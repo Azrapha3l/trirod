@@ -315,6 +315,10 @@ static void *watch_thread(void *a) {
     return NULL;
 }
 void watch_arm(void) {
+    if (!g_watch_lo && !watch_page && getenv("EOWRECOMP_WATCH")) {  // EOWRECOMP_WATCH=<lo>,<hi> (hex): any guest range
+        unsigned long long lo = 0, hi = 0;
+        if (sscanf(getenv("EOWRECOMP_WATCH"), "%llx,%llx", &lo, &hi) == 2 && lo < hi) g_watch_lo = lo, g_watch_hi = hi;
+    }
     if (!g_watch_lo || watch_page) return;
     watch_page = g_watch_lo & ~(PLAT_PAGE - 1);
     pthread_t t;

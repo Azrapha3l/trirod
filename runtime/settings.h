@@ -39,6 +39,11 @@ typedef struct {
     int prompts;         // PROMPTS_*: button glyphs (auto = follow the controller SDL reports): runtime/nvn/texpatch.c
     bool aspect_asked;   // the start screen's one-time "authentic 16:9 or unlocked?" question was answered
     bool menu_tip_seen;  // the start screen's one-time "how to open the menu" note was shown (first PLAY ever)
+    // Single-player cheats (menu Cheats tab, runtime/cheats.c): all off by default; on, they change what the game's
+    // own code stores (tools/patches.py), never the save files
+    bool cheat_rupees;   // spending doesn't lower the wallet
+    bool cheat_health;   // hearts refill to max every frame (the player's status update)
+    bool cheat_energy;   // Swordfighter Form energy doesn't drain
 } Settings;
 
 extern Settings g_settings;

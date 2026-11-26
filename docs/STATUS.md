@@ -1,6 +1,72 @@
 # Status
 
-Atualizado: 2026-11-24 (GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+Atualizado: 2026-11-26 (optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+
+## Optional cheats (2026-11-26): Infinite Rupees / Health / Hero Power; health and Hero Power tested in game (Vulkan, v1.1.0), not committed
+
+A **Cheats** tab in the in-game menu (F1; in game only, between Audio and Quit), three toggles, all off by default, saved in
+the settings file (`cheat_rupees`, `cheat_health`, `cheat_energy`). They don't write guest memory from the runtime and
+don't touch save files: `tools/patches.py` replaces a few of the game's own instructions, which read a flag word
+(`g_cheats`, `runtime/cheats.c`, exported to Trirod.dll through `tools/windows/eowrecomp.def`). With a toggle off those
+instructions do exactly what the game's did, from the next store on. **The game library must be rebuilt** (the
+generator and its patches changed: new game-code id).
+
+- **Found in the code** (static: the event queries `CheckRupee` / `CheckLife` / `GetMorphEnergyStrageLv` /
+  `HaveEnoughForLuberiWork` led to the fields; then every store to them):
+  - one block of the player's status object: wallet int +0x1b98 (clamped 0..9999), max life +0x1b08 and life +0x1b0c
+    (quarter hearts, max 0x50), Swordfighter Form energy float +0x1bb0 (cap from a table picked by storage-level bits
+    0x2000/0x4000/0x8000 of +0x1bb4). **v1.1.0 moved the whole block 0x340 lower** (+0x1858, +0x17c8/+0x17cc, +0x1870,
+    +0x1874): same writers, same functions, same order.
+  - Patches exist for main **v1.0.0 (a581406bc9858651) and v1.1.0 (9f221e1afa65ba54)** only (`BUILD_PATCHES`, chosen by
+    build id in `gen.py`); every site checks its original word (`expect()`). Another build gets none and the tab says
+    "Not available" (`cheats_init` reads exefs/main's build id).
+- **How each works:**
+  - Rupees: the 9 wallet writers that add a delta (shops, pickups, the event action `AddRupee`) keep the old value
+    when the new one is smaller; the save-load init is not patched.
+  - Hero Power: the 6 energy writers that compute from the old value (the per-frame drain in the status update,
+    pickups, accessory recovery) keep the old value when the new one is smaller; one event-action writer is
+    trace-only.
+  - Health: ordinary damage reaches **none** of the 10 life stores (scripted run: a sand piranha took a heart, no
+    patched site fired), and the store that does it wasn't found. So the cheat refills life to max at the start of the
+    player's per-frame status update (`mov x19, x0`: v1.0.0 0x70020f5eb8, v1.1.0 0x700214b2d8). Turning it on heals
+    to full. It also undoes scripted damage once the status update runs again (unavoidable without the damage site).
+    A single hit bigger than all hearts would still count.
+  - Displays follow: the HUD reads the same fields (hearts and gauge stayed full on screen).
+- **Tests:**
+  - `tools/test_cheats.py` (new; no game files: each kind of patch generated from a synthetic word, compiled against
+    cpu.h, run off/on): PASS. `tools/test_settings.c` (cheat keys default off, saved and loaded): PASS.
+  - `./setup/build.ps1` passes; game code regenerated and compiled with `trbuild code` into `<test-install>` (v1.1.0).
+  - In game: copy of a dev-install save (Gerudo Desert, 3/5 hearts, gauge Lv. 2), scratch cache / save / settings,
+    scripted load, `EOWRECOMP_CHEAT_TRACE=1` + `EOWRECOMP_VERBOSE=1` (logs each patched store that changes a value):
+
+    | Run | Swordfighter drain (site 0x700214c3c4) | Sand piranha hits |
+    |---|---|---|
+    | cheats off | 20 -> 0 in ~14 s, form ends | 3 -> 2 hearts |
+    | cheats on | held at 20 for 2,324 frames (~39 s) | life 12 -> 20 when the cheat took effect, then 3 hits 20 -> 16 each refilled the next frame; 5/5 hearts on screen |
+    | final build, cheats on (game code id 85619d230b014368) | held at 20 for all 5,021 frames | 5 hits, each refilled; F1 -> Cheats tab shows the three toggles (window shot) |
+    | final build, cheats off, same route | drains (372 frames logged, 13.8 left at the end) | **Game Over** by frame 12200 |
+
+- **Not verified:** Infinite Rupees in game (no shop reachable on the scripted route; only the patch semantics test and
+  that the 9 sites are generated); turning a toggle off mid-game from the menu (off/on compared across runs with
+  different settings files; the flag is read at every store, so off applies at the next one); Metal / macOS; v1.0.0 in
+  game (its sites pass `expect()` on the v1.0.0 extraction and generate).
+- **Might Crystals (left out on request):** the count is never stored as a number that goes down. What Lueburry's
+  upgrades check is computed (v1.0.0 f_70021d5070, v1.1.0 f_700222b1b0) as collected minus the costs of the upgrades done
+  (bits of +0x1bb4: 10/20 sword, bow, bombs Lv2/3; 5/10/20 energy levels). The patch for it (99 available) is still in
+  `patches.py` but nothing sets `CHEAT_MIGHT`: not verified, and the map's count is the crystals found (of 150).
+- **Missing-items summary (no toggle added):** it is the post-game "Key Items and echoes" feature: after the ending,
+  `Ending.bfevfl` shows the tutorial modal `AdditionalElementsModal` (the Notebook and the map's "Collected" view show
+  totals of echoes, Pieces of Heart and more; the Deku Tree names regions with echoes still missing), sets
+  `AdditionalElementsModal_Clear` and calls `SaveForGameClear`. That flag only records that the modal was seen (every
+  tutorial modal has a `<Name>Modal_Clear` flag); the totals themselves follow the game-clear state. No independent
+  display flag exists, so none was touched. Where the UI checks the clear state was not found (unknown). TriRod could
+  draw its own counts only after locating them; not started.
+- Debug added: `EOWRECOMP_WATCH=<lo>,<hi>` (hex) arms the existing page watchpoint (dispatch.c) on any guest range.
+  On Windows the page is 64 KB, so a hot object makes the game crawl (1 fps during a load): use it on quiet memory.
+- **What the user should test:** rebuild the game code, then in game open F1 -> Cheats. Infinite Health: take hits
+  (hearts refill at once), and watch for anything odd in story scenes that hurt Zelda. Infinite Hero Power:
+  Swordfighter Form should last until you leave it. Infinite Rupees: buy something; the count shouldn't drop. Switch
+  each off and check the normal behaviour returns.
 
 ## First-use shader stalls and per-frame GPU waits (2026-11-25): four changes, tested in game (Vulkan), not committed
 

@@ -8,3 +8,5 @@ EXPORTS
     rt_ticks
     fnprof_hit
     g_fnprof DATA
+    rt_cheat_trace
+    g_cheats DATA

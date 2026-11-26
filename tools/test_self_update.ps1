@@ -75,7 +75,7 @@ function New-Package([string]$dest, [string]$version, [string]$launcher) {
 # A local release: the zip and its manifest, as setup/make_release.ps1 writes them
 function New-Release([string]$dir, [string]$stage, [string]$version, [string]$sha = '') {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $zip = Join-Path $dir "Trirod-Tools-$version.zip"
+    $zip = Join-Path $dir "TriRod-$version-Windows-x64.zip"
     $entries = Get-ChildItem -LiteralPath $stage | ForEach-Object { $_.Name }
     & (Join-Path $env:SystemRoot 'System32\tar.exe') -a -c -f $zip -C $stage @entries
     if ($LASTEXITCODE -ne 0) { throw "tar failed for $zip" }

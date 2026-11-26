@@ -25,6 +25,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "../cheats.h"
 #include "touch.h"
 #include "menu.h"
 void input_reset(void);
@@ -567,6 +568,32 @@ static void tab_audio(void) {
     opt_end();
 }
 
+// Cheats (runtime/cheats.c): each one changes what the game's own code stores (tools/patches.py), saved in the settings
+// file, all off by default; switched off, the game's normal rules apply from its next change of that value.
+static void tab_cheats(void) {
+    opt_begin("##cheats", ImGui::GetFontSize() / 34);
+    opt_section("Cheats");
+    if (!cheats_available()) {
+        opt_disable_next();
+        opt_action("Not available", "", "The cheats are made for Echoes of Wisdom 1.0.0 and 1.1.0; this game files' "
+                                         "version has none.");
+        opt_end();
+        return;
+    }
+    bool ch = false;
+    ch |= opt_toggle("Infinite Rupees", &g_settings.cheat_rupees, false,
+                     "Spending Rupees doesn't lower your wallet: shops and anything else that takes Rupees leaves the "
+                     "count where it was. Rupees you find still add up (to the wallet's 9,999 limit).");
+    ch |= opt_toggle("Infinite Health", &g_settings.cheat_health, false,
+                     "Your hearts refill every frame, so a hit is undone before the next one can land. A single hit "
+                     "bigger than all your hearts would still count.");
+    ch |= opt_toggle("Infinite Hero Power", &g_settings.cheat_energy, false,
+                     "Swordfighter Form's energy gauge doesn't go down, so the form lasts until you leave it. Energy "
+                     "you pick up still fills the gauge.");
+    if (ch) cheats_sync();
+    opt_end();
+}
+
 // Quit: back to the start screen (in game: the game reboots to it) or out to the desktop. Each asks first (progress
 // since the last save is lost); B / Esc or Cancel backs out.
 extern "C" void rt_request_reboot(int kind);  // runtime/main.c (RT_REBOOT_TITLE = 2: the start screen)
@@ -711,10 +738,10 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     Tab tabs[11];
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
-    static const char *names[] = {"Video", "Audio", "", "", "", "", "", "", "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 9};  // Controls, Video, Audio, Quit (ids as in LAS Recomp: test hooks)
-    for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
-        if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
+    static const char *names[] = {"Video", "Audio", "", "", "", "", "", "Cheats", "Controls", "Quit"};
+    static const int order[] = {8, 0, 1, 7, 9};  // Controls, Video, Audio, Cheats, Quit (ids as in LAS Recomp: test hooks)
+    for (int i : order)  // (Cheats, Quit: in game only - the start screen has its own QUIT)
+        if ((i != 9 && i != 7) || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
     for (int i = 0; i < ntabs; i++) if (tabs[i].id == g_tab) cur = i;
     if (!tabs[cur].on) cur = 0;
@@ -791,6 +818,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case -1: prelaunch(scale); break;
                 case 0: tab_display(); break;
                 case 1: tab_audio(); break;
+                case 7: tab_cheats(); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }

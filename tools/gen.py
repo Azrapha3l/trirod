@@ -63,6 +63,7 @@ class Module:
         self.hi = base + n.text[0] + n.text[1]
         self.words = struct.unpack(f'<{n.text[1] // 4}I', bytes(n.image[n.text[0]:n.text[0] + n.text[1]]))
         self.lifter = Lifter(base, simd)
+        self.patches = patches_for(self.nso)  # (tools/patches.py: some are for one build of the game only)
         self.cache = {}
         self.stats = Counter()
         self.mu = None
@@ -428,9 +429,9 @@ class Module:
             if a in labels:
                 flush()
                 out.append(f'{label(a)}:;')
-            if a + SHIFT in PATCHES:  # hand-written replacement for one instruction (tools/patches.py)
+            if a + SHIFT in self.patches:  # hand-written replacement for one instruction (tools/patches.py)
                 flush()
-                out.append('    ' + PATCHES[a + SHIFT](self, a + SHIFT))
+                out.append('    ' + self.patches[a + SHIFT](self, a + SHIFT))
                 last = 'op'
                 continue
             k = ins.kind
@@ -489,7 +490,7 @@ class Module:
         return out
 
 
-from patches import PATCHES
+from patches import patches_for
 
 
 def adr_feeds_br(m, i, rd, window=64):

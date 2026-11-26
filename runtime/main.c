@@ -143,6 +143,7 @@ static void boot(const char *root) {
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
     { extern void settings_load(void); settings_load(); }
+    { extern void cheats_init(const char *exefs); cheats_init(exefs); }  // (needs the settings)
     kernel_init();
     dispatch_init();
 

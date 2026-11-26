@@ -92,6 +92,11 @@ RT_API void fnprof_hit(uint64_t addr, uint64_t lr, uint64_t x0);
 #else
 #define FN_ENTER(a) ((void)0)
 #endif
+// Optional cheats (runtime/cheats.c, the menu's Cheats tab): read by the instructions tools/patches.py replaces. A bit
+// off, the patched store writes what the game computed.
+enum { CHEAT_RUPEES = 1u, CHEAT_HEALTH = 2u, CHEAT_ENERGY = 4u, CHEAT_MIGHT = 8u, CHEAT_TRACE = 0x80000000u };
+RT_API extern volatile uint32_t g_cheats;
+RT_API void rt_cheat_trace(uint64_t site, uint64_t obj, double old, double computed, double stored);
 // Generated functions take their Cpu as `Cpu *CPU_RESTRICT c`: guest memory never overlaps the host's Cpu, so stores
 // to guest memory don't make the compiler reload guest registers.
 #define CPU_RESTRICT __restrict

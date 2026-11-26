@@ -133,6 +133,9 @@ void settings_load(void) {
             for (int i = 1; i < N_LANGUAGES; i++)
                 if (!strcmp(val, g_language_codes[i])) g_settings.language = i;
         }
+        else if (!strcmp(key, "cheat_rupees")) g_settings.cheat_rupees = atoi(val) != 0;
+        else if (!strcmp(key, "cheat_health")) g_settings.cheat_health = atoi(val) != 0;
+        else if (!strcmp(key, "cheat_energy")) g_settings.cheat_energy = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
@@ -172,6 +175,9 @@ void settings_save(void) {
     fprintf(f, "prompts = %s\n", prompts[g_settings.prompts & 3]);
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES
                                                      ? g_settings.language : LANG_AUTO]);
+    fprintf(f, "cheat_rupees = %d\n", g_settings.cheat_rupees);
+    fprintf(f, "cheat_health = %d\n", g_settings.cheat_health);
+    fprintf(f, "cheat_energy = %d\n", g_settings.cheat_energy);
     fprintf(f, "aspect_asked = %d\n", g_settings.aspect_asked);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
     bind_settings_save(f);

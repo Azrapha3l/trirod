@@ -84,6 +84,8 @@ typedef struct {
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     bool uses_bindless_image; // bindless NVN image store (SUSTB) present
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    char rsc_bufs[4][1024];  // RSC2's results (a ring: one expression uses up to 4); per translation, so the
+    int rsc_bi;              // translator is re-entrant (exec.c translates on its worker threads)
 } Ctx;
 
 // Maxwell fields are numbered from the least-significant bit of the 64-bit instruction word.
@@ -573,9 +575,7 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
 
 // Integer texel coordinates in guest units -> the (possibly larger) allocation of texture slot `slot`.
 static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
-    static char bufs[4][1024];
-    static int bi;
-    char *o = bufs[bi++ & 3];
+    char *o = c->rsc_bufs[c->rsc_bi++ & 3];
     char inner[700];
     va_list ap;
     va_start(ap, fmt);

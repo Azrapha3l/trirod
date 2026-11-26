@@ -199,6 +199,8 @@ does with pipeline keys seen in play and Triforce with its precompile at start.
   `EOWRECOMP_VK_VARIANT_FALLBACK=0` turns this off.
 - A draw into a target that nothing drew into last frame (a one-shot pass) waits for its build, within the
   per-frame budget, instead of being skipped. This is TOTK's rule.
+- Waits are limited to 400 ms per frame and 400 ms per build over all frames (`EOWRECOMP_VK_BUILD_WAIT_MS`); after
+  that, the build's draws are skipped until it is ready, so one slow build can't hold every frame for 400 ms.
 - A compute dispatch waits up to 250 ms.
 - Any other skipped draw makes the frame held: the window keeps the last complete image.
 
@@ -208,7 +210,13 @@ Each session logs `[vk] session pipelines: ...` at exit (and every 30 s with ver
 - variant fallbacks: draws made by a built variant, variants that started and stopped needing one, and the stand-ins'
   own pipelines;
 - programs reused and new;
-- driver cache hits, compiles and fast links (from `VK_PIPELINE_CREATION_FEEDBACK`).
+- driver cache hits, compiles and fast links (from `VK_PIPELINE_CREATION_FEEDBACK`);
+- build time by step, summed over programs (translate queue, translate, compile queue, GLSL to SPIR-V, stage
+  libraries) and driver time by kind. A program build over 250 ms is logged as `[vk] slow shader build: ...` with its
+  shader addresses.
+
+Shaders are translated on 2-8 threads (`EOWRECOMP_VK_TRANSLATORS`) and compiled on the worker threads
+(`EOWRECOMP_VK_WORKERS`).
 
 Misses are recorded as recipes in the player's `cache\warm`, so the next preparation and boot include them. To share
 them with all players, export them with `tools\export_shader_warm.py` (below).

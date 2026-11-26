@@ -1053,7 +1053,7 @@ static void quick_exit_handler(void) {
     if (trace < 0) trace = getenv("EOWRECOMP_VK_TRACE") != NULL;
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
-        char sum[512];
+        char sum[1024];
         vk_pipeline_session_summary(sum, sizeof sum);
         LOG("[vk] session %s\n", sum);
         vkDeviceWaitIdle(g_vk.dev);

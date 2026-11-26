@@ -21,6 +21,8 @@
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_gstore_waits;  // (gstore_sync_cbufs)
+static uint64_t stat_gstore_direct; // (gstore_sync_cbufs) draws / dispatches reading GPU-stored cbufs in place instead
+static uint64_t stat_wait_spent;    // (compile_wait) draws skipped without waiting: their build had its wait budget
 static uint64_t stat_indirect, stat_indirect_waits, stat_indirect_empty;  // (draw_indirect)
 // why draws / dispatches were skipped (the fps log line: "skipped N (why...)")
 enum { SKIP_NO_PROGRAM, SKIP_PROG_PENDING, SKIP_PROG_FAILED, SKIP_PIPE_PENDING, SKIP_PIPE_FAILED, SKIP_TOPOLOGY,
@@ -704,9 +706,23 @@ static bool sync_shaders(void) {
     return v;
 }
 
-// Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
-// translating on the game thread cost up to ~90 ms per frame on entering an area). Compiles go on to the workers.
-static pthread_mutex_t translate_lock = PTHREAD_MUTEX_INITIALIZER;  // (compute shaders translate on the game thread)
+// Shader translation: threads of its own (translating on the game thread cost up to ~90 ms per frame on entering an
+// area), separate from the workers so a translation never waits behind pipeline builds. Compiles go on to the
+// workers. There used to be one translator thread (translate.c's RSC2 kept a static string ring); with a cold cache
+// a draw waiting for its program sat behind every other translation queued before it (program waits of 6-82 ms
+// against 0.3-4 ms for pipelines). EOWRECOMP_VK_TRANSLATORS=<n> (1..16): thread count (1: as before).
+// The translator's globals are set once, before any translation (translator_globals): compute shaders translate
+// on the game thread at the same time.
+static void set_translator_globals(void) {
+    const char *e = getenv("EOWRECOMP_SHADER_GUARD");
+    if (e && atoi(e) > 0) maxwell_loop_guard = (uint32_t)atoi(e);
+    maxwell_gmem_base = HEAP_BASE;
+    maxwell_gmem_size = HEAP_MAX;
+}
+static void translator_globals(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, set_translator_globals);
+}
 static JobQueue tjobs = {.lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
 static void *translator(void *a) {
     (void)a;
@@ -741,7 +757,20 @@ static void jobs_bump(JobQueue *q, void *arg) {
     pthread_mutex_unlock(&q->lock);
 }
 
-static void start_translator(void) { pthread_t t; pthread_create(&t, NULL, translator, NULL); }
+static void start_translator(void) {
+    int cores = SDL_GetNumLogicalCPUCores(), n = cores / 6;  // (28 logical CPUs: 4, next to 16 workers)
+    if (n < 2) n = 2;
+    if (n > 8) n = 8;
+    const char *e = getenv("EOWRECOMP_VK_TRANSLATORS");
+    if (e && *e) {
+        char *end = NULL;
+        long v = strtol(e, &end, 10);
+        if (end != e && !*end && v >= 1 && v <= 16) n = (int)v;
+        else LOG("[vk] ignoring invalid EOWRECOMP_VK_TRANSLATORS='%s' (use 1..16)\n", e);
+    }
+    LOG("[vk] shader translator threads: %d\n", n);
+    for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, translator, NULL); }
+}
 static void run_translate_q(void (*fn)(void *), void *arg, bool low) {
     if (sync_shaders()) { fn(arg); return; }
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -865,7 +894,7 @@ const char *renderer_stats(void) {
         static uint64_t last_ns;
         uint64_t now = SDL_GetTicksNS();
         if (rt_verbose() && now - last_ns > 30000000000ull) {
-            char sum[512];
+            char sum[1024];
             vk_pipeline_session_summary(sum, sizeof sum);
             LOG("[vk] session %s\n", sum);
             last_ns = now;
@@ -885,6 +914,16 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, " | indirect draws %llu (%llu empty, %llu waits)", (unsigned long long)stat_indirect,
                  (unsigned long long)stat_indirect_empty, (unsigned long long)stat_indirect_waits);
         stat_indirect = stat_indirect_empty = stat_indirect_waits = 0;
+    }
+    if (stat_wait_spent) {  // (compile_wait: builds that already had their 400 ms)
+        size_t n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | waits used up %llu", (unsigned long long)stat_wait_spent);
+        stat_wait_spent = 0;
+    }
+    if (stat_gstore_direct) {  // (gstore_sync_cbufs: GPU-stored constant buffers read in place, no wait)
+        size_t n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | gpu-stored cbufs in place %llu", (unsigned long long)stat_gstore_direct);
+        stat_gstore_direct = 0;
     }
     if (stat_gstore_waits) {  // (gstore_sync_cbufs: waits for GPU-stored constant buffers)
         size_t n = strlen(stats_text);
@@ -1396,7 +1435,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 #define MAX_BIND 96
 typedef struct Prog {
     ShaderInfo *vi, *fi;
-    uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
+    uint64_t code[2], cmax[2];  // translation inputs (copied: translated on a translator thread)
     uint64_t source_key, source_hash[2];  // stable identity for disk pipeline recipes
     uint64_t gid[2];      // guest code identity of the VS / FS (warm_code_id), 0 = unknown: what recipes are keyed by
     uint32_t gext[2];     // bytes of guest code the translator reads (maxwell_code_extent)
@@ -1413,6 +1452,8 @@ typedef struct Prog {
     _Atomic int state;  // 0 building, 1 ready, 2 failed
     struct Prog *family_next;  // other variants of the same guest code (variant_family_*)
     bool fallback_open;        // (render thread) a draw of this variant used a stand-in; not yet drawn by itself
+    uint64_t waited_ns;        // (render thread) draws' compile_wait time on this build so far, over all frames
+    uint64_t t_queued, t_translated, ns_translate;  // (build timings, compile_program) SDL_GetTicksNS
 } Prog;
 
 static uint64_t glsl_source_hash(const char *src, int stage) {
@@ -1572,6 +1613,10 @@ static struct {
     uint64_t reused_ready, reused_building, missed, prog_reused, prog_missed;
     uint64_t fb_draws, fb_started, fb_replaced, fb_pipes;
     _Atomic uint64_t cache_hit, compiled, linked, lib_hit, lib_compiled;
+    // Build time by step (ns), to tell what makes a first use slow: a program waits in the translation queue,
+    // translates, waits for a worker, compiles GLSL to SPIR-V, creates its stage libraries; driver_ns: time in
+    // vkCreateGraphicsPipelines by kind (complete pipeline, stage library, fast link).
+    _Atomic uint64_t progs_timed, ns_tqueue, ns_translate, ns_cqueue, ns_spirv, ns_libs, driver_ns[3];
 } sess;
 
 // vkCreateGraphicsPipelines for one pipeline, counted: kind 0 a complete pipeline, 1 a shader-stage library, 2 a fast
@@ -1582,7 +1627,9 @@ static VkResult create_counted(VkGraphicsPipelineCreateInfo *ci, VkPipeline *out
                                                .pNext = ci->pNext, .pPipelineCreationFeedback = &fb};
     const void *next = ci->pNext;
     ci->pNext = &fi;
+    uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, ci, NULL, out);
+    atomic_fetch_add(&sess.driver_ns[kind], SDL_GetTicksNS() - t0);
     ci->pNext = next;
     if (r != VK_SUCCESS) return r;
     bool hit = (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
@@ -1600,17 +1647,29 @@ void vk_pipeline_session_summary(char *out, size_t n) {
     snprintf(out, n, "pipelines: %d prepared from recipes (%d built); first draws: %llu reused ready, %llu reused still "
              "building, %llu missed (new); programs %llu reused, %llu new; driver: %llu from cache, %llu compiled, %llu "
              "fast-linked; stage libraries %llu from cache, %llu compiled; variant fallbacks: %llu draws, %llu started, "
-             "%llu replaced by the exact variant, %llu stand-in pipelines",
+             "%llu replaced by the exact variant, %llu stand-in pipelines; build time (%llu programs): translate queue %.0f ms, "
+             "translate %.0f ms, compile queue %.0f ms, SPIR-V %.0f ms, stage libraries %.0f ms; driver: complete pipelines "
+             "%.0f ms, libraries %.0f ms, fast links %.0f ms",
              w.pipelines, w.pipelines_ok, (unsigned long long)sess.reused_ready, (unsigned long long)sess.reused_building,
              (unsigned long long)sess.missed, (unsigned long long)sess.prog_reused, (unsigned long long)sess.prog_missed,
              (unsigned long long)atomic_load(&sess.cache_hit), (unsigned long long)atomic_load(&sess.compiled),
              (unsigned long long)atomic_load(&sess.linked), (unsigned long long)atomic_load(&sess.lib_hit),
              (unsigned long long)atomic_load(&sess.lib_compiled), (unsigned long long)sess.fb_draws,
-             (unsigned long long)sess.fb_started, (unsigned long long)sess.fb_replaced, (unsigned long long)sess.fb_pipes);
+             (unsigned long long)sess.fb_started, (unsigned long long)sess.fb_replaced, (unsigned long long)sess.fb_pipes,
+             (unsigned long long)atomic_load(&sess.progs_timed), atomic_load(&sess.ns_tqueue) / 1e6, atomic_load(&sess.ns_translate) / 1e6,
+             atomic_load(&sess.ns_cqueue) / 1e6, atomic_load(&sess.ns_spirv) / 1e6, atomic_load(&sess.ns_libs) / 1e6,
+             atomic_load(&sess.driver_ns[0]) / 1e6, atomic_load(&sess.driver_ns[1]) / 1e6, atomic_load(&sess.driver_ns[2]) / 1e6);
 }
 
 static void compile_program(void *arg) {
     Prog *p = arg;
+    uint64_t t_start = SDL_GetTicksNS();
+    {   // EOWRECOMP_VK_BUILD_DELAY_MS=<ms> (test): every program build takes that much longer - a slow first use on
+        // demand, for compile_wait's budgets
+        static int delay = -1;
+        if (delay < 0) { const char *e = getenv("EOWRECOMP_VK_BUILD_DELAY_MS"); delay = e ? atoi(e) : 0; }
+        if (delay > 0) SDL_Delay((uint32_t)delay);
+    }
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     const char *fs_src = p->fi->msl;
@@ -1653,6 +1712,7 @@ static void compile_program(void *arg) {
     p->fs = vk_module(sf, nf);
     free(sv);
     free(sf);
+    uint64_t t_spirv = SDL_GetTicksNS();
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
 #ifdef VK_EXT_graphics_pipeline_library
     if (p->vs && p->fs && vk_gpl_available() &&
@@ -1660,24 +1720,41 @@ static void compile_program(void *arg) {
         LOG("[vk] shader-library creation failed; using monolithic pipeline fallback\n");
 #endif
     atomic_fetch_add(&stat_compiles, 1);
+    {   // build time by step (sess); a slow one is logged with its code addresses, to find the shader behind a stall
+        uint64_t t_end = SDL_GetTicksNS();
+        uint64_t tq = p->t_queued && p->t_translated > p->t_queued + p->ns_translate ? p->t_translated - p->ns_translate - p->t_queued : 0;
+        uint64_t cq = t_start > p->t_translated ? t_start - p->t_translated : 0;
+        atomic_fetch_add(&sess.progs_timed, 1);
+        atomic_fetch_add(&sess.ns_tqueue, tq);
+        atomic_fetch_add(&sess.ns_translate, p->ns_translate);
+        atomic_fetch_add(&sess.ns_cqueue, cq);
+        atomic_fetch_add(&sess.ns_spirv, t_spirv - t_start);
+        atomic_fetch_add(&sess.ns_libs, t_end - t_spirv);
+        uint64_t total = p->t_queued ? t_end - p->t_queued : t_end - t_start;
+        static _Atomic int nslow;
+        if (total >= 250000000ull && atomic_fetch_add(&nslow, 1) < 32)
+            LOG("[vk] slow shader build: vs %llx fs %llx%s took %.0f ms = translate queue %.0f + translate %.1f + compile queue %.0f + "
+                "SPIR-V %.1f + stage libraries %.1f\n", (unsigned long long)p->code[0], (unsigned long long)p->code[1],
+                p->warm ? " (warmup)" : "", total / 1e6, tq / 1e6, p->ns_translate / 1e6, cq / 1e6, (t_spirv - t_start) / 1e6,
+                (t_end - t_spirv) / 1e6);
+    }
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
     warm_prog_done(p);
 }
 
 static void translate_program(void *arg) {
     Prog *p = arg;
-    { static int g = -1; if (g < 0) { const char *e = getenv("EOWRECOMP_SHADER_GUARD"); g = e ? atoi(e) : 0; if (g > 0) maxwell_loop_guard = (uint32_t)g; } }
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    translator_globals();
     save_shader_blob(p->code[0], p->cmax[0], "vs");
     save_shader_blob(p->code[1], p->cmax[1], "fs");
-    pthread_mutex_lock(&translate_lock);
+    uint64_t t0 = SDL_GetTicksNS();
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
         p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
-    pthread_mutex_unlock(&translate_lock);
+    p->t_translated = SDL_GetTicksNS();
+    p->ns_translate = p->t_translated - t0;
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
@@ -1798,6 +1875,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     p->vkey = *vkey;
     p->fkey = *fkey;
     variant_family_add(p);
+    p->t_queued = SDL_GetTicksNS();
     run_translate(translate_program, p);
     return p;
 }
@@ -1995,6 +2073,7 @@ typedef struct {
     _Atomic int state, optimized_state;
     bool warm;
     bool stand_in;  // a variant fallback's pipeline (draw_): temporary, so no optimized replacement
+    uint64_t waited_ns;  // (render thread) draws' compile_wait time on this build so far, over all frames
 } Pipe;  // state: 0 building, 1 ready, 2 failed
 #define PIPE_TAB 65536
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
@@ -2443,7 +2522,7 @@ void vk_warm_save(void) {
     LOG(ok ? "[warm] saved %u pipeline recipes\n" : "[warm] could not save the %u pipeline recipes\n", n);
 }
 
-// The guest code of a program translated from guest memory, once per code id (translator thread).
+// The guest code of a program translated from guest memory, once per code id (translator threads).
 static void warm_save_code(const Prog *p) {
     if (warm_off()) return;
     for (int i = 0; i < 2; i++) {
@@ -2551,7 +2630,7 @@ bool vk_warm_progress(int *done, int *total) {
 static void *warm_enqueue(void *a) {  // (EOWRECOMP_SYNC_SHADERS: these run inline, so not on the UI thread)
     (void)a;
     for (int i = 0; i < WARM_PROG_TAB; i++)
-        if (warm_progs[i].key) run_translate_q(translate_program, warm_progs[i].p, true);
+        if (warm_progs[i].key) warm_progs[i].p->t_queued = SDL_GetTicksNS(), run_translate_q(translate_program, warm_progs[i].p, true);
     return NULL;
 }
 
@@ -3271,6 +3350,11 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
+// (gstore_sync_cbufs, below) constant buffers of this draw / dispatch, per stage, to read in place from the imported
+// heap: bit k = cbuf k holds memory a shader stored to in work not finished yet
+static uint32_t gstore_direct[6];
+static bool gstore_direct_info(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -3310,6 +3394,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
+    {   // memory a shader stores to in unfinished work: read in place, after it (gstore_sync_cbufs)
+        VkDescriptorBufferInfo d;
+        if ((gstore_direct[stage] & (1u << k)) && gstore_direct_info(r.addr, size, &d)) return d;
+    }
     // Diagnostic A/B test for the EoW void composite. Override only shader CB12[2].y
     // for this fragment shader, and only in the transient Vulkan copy. Guest memory stays untouched.
     if (stage == 1 && k == 12 && r.addr && size >= 0x28 && st.program &&
@@ -3339,6 +3427,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
+static bool gmem_ubo;  // gmem_buf also has uniform-buffer usage (gstore_direct_info)
 
 static bool gmem_debug_off(void) {
     static int off = -1;
@@ -3362,11 +3451,22 @@ static bool gmem_import(uint64_t size) {
     if (vkAllocateMemory(g_vk.dev, &ai, NULL, &mem) != VK_SUCCESS) return false;
     VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    // (also a uniform buffer: gstore_direct_info binds GPU-stored constant buffers in place; without it if the
+    // imported memory's type doesn't allow that usage)
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
     VkBuffer buf;
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &req);
+    gmem_ubo = (req.memoryTypeBits >> ai.memoryTypeIndex) & 1;
+    if (!gmem_ubo) {
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        bi.usage &= ~(VkBufferUsageFlags)VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
+        LOG("[vk] guest heap import: not usable as a uniform buffer; GPU-stored constant buffers wait for the GPU\n");
+    }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
     if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
         vk_wait_seq(submit_seq);
@@ -3649,6 +3749,11 @@ static void vc_mark_sbufs(int stage) {
 // it stayed fully transparent. So: the bound storage ranges of each storing shader are remembered until their
 // submission completes, and a draw / dispatch about to snapshot an overlapping constant buffer waits for the GPU
 // first (before its render pass starts: the submission ends the pass). EOWRECOMP_VK_GSTORE_SYNC=0: off (A/B test).
+// That wait was once a frame in normal play (~0.7 ms a frame, "GPU-stored memory read as a constant buffer"). Now such
+// a constant buffer is bound in place from the imported heap instead, when the heap is usable as a uniform buffer and
+// the range fits the binding limits: the GPU reads it after the store (passes and dispatches are separated by full
+// barriers; earlier submissions come first on the queue), which is also what the Switch does - its constant buffers
+// are read from memory when the GPU runs the draw. EOWRECOMP_VK_GSTORE_DIRECT=0: wait and copy as before (A/B test).
 #define GSTORE_MAX 64
 static struct { uint64_t lo, hi; } gstore[GSTORE_MAX];  // guest addresses [lo, hi)
 static int ngstore;
@@ -3702,9 +3807,22 @@ static bool gstore_pending(void) {
     return true;
 }
 
-// The constant buffers `si` (stage) is about to snapshot: wait for the GPU if one overlaps a pending store.
+static bool gstore_direct_info(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_GSTORE_DIRECT"); on = !e || atoi(e) != 0; }
+    uint64_t align = g_vk.props.limits.minUniformBufferOffsetAlignment;
+    if (!on || !gmem_buf || !gmem_ubo || addr < HEAP_BASE || addr + size > HEAP_BASE + gmem_size) return false;
+    if ((align && (addr - HEAP_BASE) % align) || size > g_vk.props.limits.maxUniformBufferRange) return false;
+    *out = (VkDescriptorBufferInfo){gmem_buf, addr - HEAP_BASE, size};
+    return true;
+}
+
+// The constant buffers `si` (stage) is about to snapshot: read in place (gstore_direct) or wait for the GPU if one
+// overlaps a pending store.
 static void gstore_sync_cbufs(int stage, const ShaderInfo *si) {
+    gstore_direct[stage] = 0;
     if (!si || !gstore_pending()) return;
+    uint32_t direct = 0;
     for (int k = 3; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
         Range r = st.ubuf[stage][k - 3];
@@ -3715,6 +3833,11 @@ static void gstore_sync_cbufs(int stage, const ShaderInfo *si) {
         bool hit = gstore_all;
         for (int i = 0; i < ngstore && !hit; i++) hit = r.addr < gstore[i].hi && r.addr + size > gstore[i].lo;
         if (!hit) continue;
+        VkDescriptorBufferInfo d;
+        if (gstore_direct_info(r.addr, size < 16 ? 16 : size, &d)) {  // (cbuf_info's size, at least 16)
+            direct |= 1u << k;
+            continue;
+        }
         static int nlog;
         if (nlog++ < 16)
             LOG_VERBOSE("[vk] gpu-stored memory read as a constant buffer: stage %d c%d %llx+%llx (%s %llx); waiting for the GPU\n",
@@ -3726,8 +3849,10 @@ static void gstore_sync_cbufs(int stage, const ShaderInfo *si) {
         st.rt_dirty = true;
         ngstore = 0;
         gstore_all = false;
-        return;
+        return;  // (everything is complete now: nothing to read in place)
     }
+    if (direct) stat_gstore_direct++;
+    gstore_direct[stage] = direct;
 }
 
 static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
@@ -4164,13 +4289,10 @@ static CsProg *compute_program(NvnProgram *np) {
     for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
-    maxwell_gmem_base = HEAP_BASE;
-    maxwell_gmem_size = HEAP_MAX;
+    translator_globals();
     ShaderKey k = {0};
     k.glsl = 1;
-    pthread_mutex_lock(&translate_lock);
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
-    pthread_mutex_unlock(&translate_lock);
     cp->p.vi = cp->si;
     if (!cp->si->msl) {
         LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);
@@ -4671,14 +4793,33 @@ static bool compile_wait(CmdRec *r, bool indexed, _Atomic int *state, Prog *p, P
         TexBackend *tb = t ? t->backend : NULL;
         oneshot = tb && tb->drawn_frame < vk_frame_counter();  // (drawn_frame = frame + 1: last frame -> == counter)
     }
-    if ((!off && quad) || known || oneshot) {
+    // The 400 ms are per frame and also per build: with only the per-frame budget, one build that took ~6 s (cold
+    // cache, after the prologue: "shader jobs queued 1") made every frame wait its full 400 ms and skip anyway -
+    // 2.4 fps for 6 s. Once a build has had its 400 ms (over any number of frames), its draws skip like scene
+    // geometry until it is ready (backend_present still holds the last complete image for a while).
+    // EOWRECOMP_VK_BUILD_WAIT_MS=<ms>: that per-build allowance (0: none, the per-frame budget only, as before).
+    static int64_t build_budget = -1;
+    if (build_budget < 0) {
+        const char *e = getenv("EOWRECOMP_VK_BUILD_WAIT_MS");
+        build_budget = e && *e ? (int64_t)atoi(e) * 1000000 : 400000000;
+        if (build_budget <= 0) build_budget = INT64_MAX / 2;
+    }
+    uint64_t *build_waited = pp ? &pp->waited_ns : &p->waited_ns;
+    if (((!off && quad) || known || oneshot) && *build_waited >= (uint64_t)build_budget) {
+        static int nlog;
+        if (nlog++ < 32)
+            LOG_VERBOSE("[vk] draw not waiting: its %s (fs=%llx) has had its %.0f ms of waits and is still building\n", pp ? "pipeline" : "program",
+                (unsigned long long)(st.program ? st.program->stages[1].code_addr : 0), *build_waited / 1e6);
+        stat_wait_spent++;
+    } else if ((!off && quad) || known || oneshot) {
         extern uint64_t vk_frame_counter(void);
         static uint64_t budget_frame = ~0ull;
         static uint64_t spent_ns;
         uint64_t frame = vk_frame_counter();
         if (frame != budget_frame) { budget_frame = frame; spent_ns = 0; }
         uint64_t t0 = SDL_GetTicksNS();
-        while (atomic_load(state) == 0 && spent_ns + (SDL_GetTicksNS() - t0) < 400000000ull) {
+        while (atomic_load(state) == 0 && spent_ns + (SDL_GetTicksNS() - t0) < 400000000ull &&
+               *build_waited + (SDL_GetTicksNS() - t0) < (uint64_t)build_budget) {
             void *arg = pp ? (void *)pp : (void *)p;
             jobs_bump(&tjobs, arg);
             jobs_bump(&jobs, arg);
@@ -4686,6 +4827,7 @@ static bool compile_wait(CmdRec *r, bool indexed, _Atomic int *state, Prog *p, P
         }
         uint64_t waited = SDL_GetTicksNS() - t0;
         spent_ns += waited;
+        *build_waited += waited;
         static int nlog;
         if (nlog++ < 32)
             LOG_VERBOSE("[vk] %s draw waited %.1f ms for its %s (fs=%llx, %ux%u target)%s\n",

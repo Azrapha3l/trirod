@@ -159,7 +159,7 @@ static atomic_int g_next, g_done, g_ok, g_translate_failed, g_spirv_failed, g_gp
     g_lib_done;
 static ShaderKey g_vkey, g_fkey;
 static Catalog g_cat;
-static pthread_mutex_t g_translate_lock = PTHREAD_MUTEX_INITIALIZER;  // (the translator keeps global state)
+static pthread_mutex_t g_reasons_lock = PTHREAD_MUTEX_INITIALIZER;  // (note_failure's table; the translator itself is re-entrant)
 
 // Translation failures by the translator's own message (its error text), for the log: which Maxwell features the
 // catalog's shaders need that translate.c lacks
@@ -179,12 +179,12 @@ static void note_failure(const char *stage, const ShaderInfo *si, const uint8_t 
     }
     char t[160];
     snprintf(t, sizeof t, "%s: %s", stage, si ? si->error : "no code in the catalog");
-    pthread_mutex_lock(&g_translate_lock);
+    pthread_mutex_lock(&g_reasons_lock);
     int i = 0;
     while (i < g_nreasons && strcmp(g_reasons[i].text, t)) i++;
     if (i == g_nreasons && g_nreasons < MAX_REASONS) snprintf(g_reasons[g_nreasons++].text, sizeof g_reasons[0].text, "%s", t);
     if (i < g_nreasons) g_reasons[i].count++;
-    pthread_mutex_unlock(&g_translate_lock);
+    pthread_mutex_unlock(&g_reasons_lock);
 }
 
 static bool spirv(const char *src, int stage, const char *name) {
@@ -204,9 +204,7 @@ static void *translate_worker(void *arg) {
         if (j->ps == CAT_NONE) {
             ShaderKey k = {0};
             k.glsl = 1;  // (exec.c compute_program: the only key a compute shader has)
-            pthread_mutex_lock(&g_translate_lock);
             ShaderInfo *si = vc ? maxwell_translate(vc, vlen, STAGE_COMPUTE, &k) : NULL;
-            pthread_mutex_unlock(&g_translate_lock);
             atomic_fetch_add(&g_translated, 1);
             if (!si || !si->msl) atomic_fetch_add(&g_translate_failed, 1), note_failure("cs", si, vc, vlen);
             else if (!(ok = spirv(si->msl, STAGE_COMPUTE, "cs"))) atomic_fetch_add(&g_spirv_failed, 1);
@@ -214,13 +212,11 @@ static void *translate_worker(void *arg) {
         } else {
             const uint8_t *fc = catalog_code(&g_cat, j->ps, &flen, &fst);
             ShaderKey fk = g_fkey;
-            pthread_mutex_lock(&g_translate_lock);
             ShaderInfo *vi = vc && fc ? maxwell_translate(vc, vlen, STAGE_VERTEX, &g_vkey) : NULL, *fi = NULL;
             if (vi && vi->msl) {
                 fk.vs_out_mask = vi->out_mask;  // (exec.c translate_program)
                 fi = maxwell_translate(fc, flen, STAGE_FRAGMENT, &fk);
             }
-            pthread_mutex_unlock(&g_translate_lock);
             atomic_fetch_add(&g_translated, 1);
             if (!vi || !vi->msl || !fi || !fi->msl) {
                 atomic_fetch_add(&g_translate_failed, 1);

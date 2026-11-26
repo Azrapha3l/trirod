@@ -2,6 +2,80 @@
 
 Atualizado: 2026-11-24 (GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
 
+## First-use shader stalls and per-frame GPU waits (2026-11-25): four changes, tested in game (Vulkan), not committed
+
+From the performance audit of the same day. Measured first (warm cache, 1x, `EOWRECOMP_VK_PROF=1`): 60 fps held,
+~2.3 ms of render-thread CPU and ~2.6-4.4 ms of GPU per frame, so the frame is not CPU-bound and low CPU use is
+expected (the game steps its world at 60 Hz). The trouble was first use: in a cold run (empty cache, fresh save,
+Dynamic, 230 s prologue route with A presses) 34 of 112 two-second windows were under 55 fps, and frames 6980-6995
+took ~425 ms each (2.4 fps for ~6 s).
+
+- **1. Wait budget per build** (`compile_wait`): full-screen / one-shot / warmup draws wait up to 400 ms per frame
+  for their build; that budget restarted every frame, so one build that stayed in the queue for ~6 s made every
+  frame wait 400 ms and skip anyway. Now a build also gets at most 400 ms of waits in total, over all frames; after
+  that its draws skip like scene geometry (backend_present still holds the last complete image a while). Counter
+  `waits used up N` in the fps line; verbose `[vk] draw not waiting: ...`. `EOWRECOMP_VK_BUILD_WAIT_MS=<ms>` sets the
+  per-build budget (0: none, the old behaviour); `EOWRECOMP_VK_BUILD_DELAY_MS=<ms>` (test) makes every program build
+  that much slower.
+- **2. Translation on several threads.** The translator wasn't re-entrant (translate.c `RSC2` returned its texel
+  coordinates in a static 4-entry ring), so exec.c had one translator thread and ShaderPrep a global lock; a waiting
+  draw's program sat behind every translation queued before it. The ring is now per translation (`Ctx`), exec.c runs
+  `cores / 6` translator threads (2-8; 4 with 28 logical CPUs; `EOWRECOMP_VK_TRANSLATORS=<n>`, 1 = as before), the
+  translator's globals are set once (`translator_globals`), and ShaderPrep translates without the lock.
+  Test: `tools/test_translate_mt.sh` (programs from test_translate.c translated on one thread, then on 8 / 16 at
+  once; every result must equal). Passes; with `REF=f85ef0a` (the old translator) the fetch-only pass had 193 of
+  960,000 translations differ. `REF=HEAD tools/test_translate.sh 4000 8 both`: 0 MSL differences, GLSL 0
+  compile/validation failures, extent 0 differences.
+- **3. Build timings.** The session line (`[vk] session ...`, every 30 s verbose and at exit) adds the time of each
+  build step summed over programs: translate queue, translate, compile queue, SPIR-V, stage libraries, and driver time
+  by kind (complete pipelines, libraries, fast links). A program build over 250 ms logs `[vk] slow shader build: vs ..
+  fs .. took N ms = ...` (first 32). The summary buffers grew to 1024 bytes (the line was cut at 512).
+- **4. GPU-stored constant buffers read in place.** A draw binding as a constant buffer memory a compute shader
+  stores to in unfinished work flushed and waited for the GPU (`gstore_sync_cbufs`): once a frame in normal play,
+  ~0.7 ms. The heap import (`gmem_buf`) now also has uniform-buffer usage (checked against the import's memory type)
+  and such a cbuf is bound in place (offset alignment and range limits checked; else the wait as before): the GPU
+  reads it after the store, as the Switch does. `gpu-stored cbufs in place N` in the fps line;
+  `EOWRECOMP_VK_GSTORE_DIRECT=0` for the old wait.
+
+**Results (RTX 5060, 28 logical CPUs, `D:\Games\EoW` dev install, scratch cache/save/settings):**
+
+| | before | after |
+|---|---|---|
+| Cold route, 2 s windows under 55 fps | 34 of 112 | 3 of 112 |
+| Cold route, lowest window / mean fps | 2.3 / 54.3 | 37.5 / 58.7 |
+| Cold route, draws skipped while building | 2,770 | 484 |
+| Warm 1x, render-thread CPU per 2 s (`cpu exec`) | 241 ms | 152 ms |
+| Warm 1x, GPU waits for GPU-stored cbufs per 2 s | 86 ms (120 waits) | 0 |
+| Warm 1x, GPU time per 2 s | 399 ms | 414 ms (+4%: those cbufs are read from host memory) |
+| Warm 1x, submissions per frame | 3 | 2 |
+
+- Cold run build times (96 programs): translate queue 58 ms, translate 236 ms, compile queue 196 ms, SPIR-V 1,947 ms,
+  stage libraries 621 ms in total - GLSL to SPIR-V (shaderc) is now the largest step; no build went over 250 ms.
+- The 6 s build of the old run did not happen again, so its cause is unknown (no timings then); the new log line
+  names the shader if it comes back. So change 1 was not exercised by the normal cold run ("waits used up" 0).
+- Change 1 on demand: cold 90 s route with `EOWRECOMP_VK_BUILD_DELAY_MS=1500` (every program build 1.5 s slower).
+  Per-build budget: mean 51.1 fps, 5 of 41 windows under 20 fps, 3,020 draws skipped without waiting, 10,622 skipped
+  in all. `EOWRECOMP_VK_BUILD_WAIT_MS=0` (old rule): mean 41.6 fps, 9 windows under 20 fps, 6,566 skipped. Both still
+  start with windows at 2.3 fps (many new builds at once, each with its own 400 ms); screenshots normal in both. The
+  slow-build log named each shader and put the delay in the SPIR-V step, as expected.
+- ShaderPrep, catalog only (`--no-recipes`, scratch caches, 7,450 pairs + 37 compute): 1,280 s with the old binary,
+  1,205 s with the new one (-6%); the same 8,991 SPIR-V files, all 7,450 library pairs created. The translation lock
+  was not ShaderPrep's bottleneck (stage-library creation and shaderc are).
+- Images: warm A/B (`EOWRECOMP_VK_GSTORE_DIRECT=0` vs default, same inputs): static frames within 0.01% of pixels;
+  the fight frames differ by camera/animation timing only (checked side by side). Cold-run contact sheet normal.
+- Validation (`EOWRECOMP_VK_VALIDATION=1`, 120 s route): only the known "c0 without a colour attachment" warning.
+  The validation layer itself crashed at ~106 s (a C++ exception inside `VkLayer_khronos_validation.dll`, under
+  `vkWaitSemaphores` from `nvnSyncWait`); with in-place cbufs off and one translator thread it crashed the same way
+  at ~108 s (an access violation in the layer), so it is not from these changes. Not traced.
+- Not tested: Metal (unchanged: `metal.m` has its own paths), GPUs other than this one (AMD/Intel minimum UBO
+  alignments differ; a misaligned range keeps the wait), `EOWRECOMP_VK_GPL=0`, gameplay past the prologue corridor.
+- **Next:** shaderc is now the largest first-use step (SPIR-V ~20 ms a program on average in the cold run); the
+  audit's other items (per-pass full barriers, dynamic state 3, DLSS / frame generation) are not started.
+- **What the user should test:** play a first visit with an empty `cache` copy (or a new area): fewer long freezes
+  when shaders build. Watch the fps line in `--console` for `waits used up` and the log for `[vk] slow shader build`
+  (send those lines if a freeze comes back). Effects that read compute results (the void / rift, Hyrule Town trees)
+  should look as before; if one looks wrong, compare with `EOWRECOMP_VK_GSTORE_DIRECT=0`.
+
 ## Dynamic resolution lattice (2026-11-25): light grid scaled below 1x; fixed (Vulkan), tested in game, not committed
 
 - **Seen:** a dark lattice of tile-sized blocks over walls and floors, with stair-stepped edges and smeared floor

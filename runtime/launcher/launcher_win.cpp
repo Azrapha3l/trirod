@@ -1372,6 +1372,7 @@ static const ImVec4 AQUA(0.24f, 0.85f, 0.77f, 1.0f);
 static SDL_Texture *g_launcher_logo;
 static SDL_Texture *g_launcher_skin;
 static int g_skin_text_child_id;
+static float g_launcher_min_font_size = 24.0f;
 
 static ImVec2 skin_point(float x, float y, float sx, float sy) {
     ImVec2 origin = ImGui::GetWindowPos();
@@ -1389,7 +1390,8 @@ static void skin_text(const char *text, float x, float y, float width, float hei
     ImGui::BeginChild("##skin-text", ImVec2(width * sx, height * sy), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     if (font && font_size > 0.0f) {
-        ImGui::SetWindowFontScale(font_size * std::min(sx, sy) / font->FontSize);
+        float render_size = std::max(font_size * std::min(sx, sy), g_launcher_min_font_size);
+        ImGui::SetWindowFontScale(render_size / font->FontSize);
         if (centered) {
             ImVec2 avail = ImGui::GetContentRegionAvail();
             ImVec2 text_size = ImGui::CalcTextSize(text);
@@ -1426,6 +1428,7 @@ static bool skin_button(const char *label, const char *id, float x, float y, flo
     }
     if (active) dl->AddRectFilled(a, b, IM_COL32(15, 20, 27, 48), 7.0f);
     float fs = font_size > 0.0f ? font_size * std::min(sx, sy) : 18.0f * std::min(sx, sy);
+    fs = std::max(fs, g_launcher_min_font_size);
     ImFont *f = font ? font : ImGui::GetFont();
     ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
     ImU32 c = enabled ? color : IM_COL32(165, 162, 151, 220);
@@ -1551,7 +1554,7 @@ static bool launcher_button(const char *label, bool enabled, ImVec2 size, bool p
                           primary ? IM_COL32(255, 248, 198, (int)(225 * alpha)) : accent);
     }
     ImFont *label_font = font ? font : ImGui::GetFont();
-    float label_size = label_font->FontSize;
+    float label_size = std::max(label_font->FontSize, g_launcher_min_font_size);
     ImVec2 text_size = label_font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, label);
     ImVec2 text_pos((a.x + b.x - text_size.x) * 0.5f, (a.y + b.y - text_size.y) * 0.5f);
     ImU32 text_col = primary ? IM_COL32(45, 34, 13, (int)(255 * alpha)) : IM_COL32(235, 228, 205, (int)(255 * alpha));
@@ -1744,6 +1747,8 @@ int main(int argc, char **argv) {
     ImFont *display = file_exists(ui_serif) ? io.Fonts->AddFontFromFileTTF(ui_serif.c_str(), 31 * scale) : NULL;
     ImFont *serif = file_exists(ui_serif) ? io.Fonts->AddFontFromFileTTF(ui_serif.c_str(), 16 * scale) : NULL;
     if (!font) font = io.Fonts->AddFontDefault();
+    g_launcher_min_font_size = step_font ? step_font->FontSize : font->FontSize;
+    io.FontDefault = step_font ? step_font : font;
     ImGui_ImplSDL3_InitForSDLRenderer(win, ren);
     ImGui_ImplSDLRenderer3_Init(ren);
     SDL_Log("[launcher] renderer %s, install %s, data %s%s", SDL_GetRendererName(ren), g_paths.install.c_str(),
@@ -1833,6 +1838,7 @@ int main(int argc, char **argv) {
                              : ready ? (need_update ? "An update is available" : "Ready to play")
                              : !tools.present ? (g_dev ? "Build the local package first (setup/build.ps1)" : "The tools need to be downloaded")
                              : !can_build ? "Choose your game files"
+                             : need_update ? "Update to install the latest version (" + not_ready + ")"
                              : "Recompile to build the game for this version (" + not_ready + ")";
 
         ImGui_ImplSDLRenderer3_NewFrame();
@@ -1850,70 +1856,71 @@ int main(int argc, char **argv) {
 
         std::string version = version_label(tools.present ? tools.version : TRIROD_VERSION);
         skin_text("TriRod", 200, 51, 242, 72, sx, sy, IM_COL32(246, 226, 182, 255), display, 52);
-        skin_text(version.c_str(), 443, 75, 150, 40, sx, sy, IM_COL32(224, 190, 111, 255), serif, 22);
+        skin_text(version.c_str(), 443, 75, 150, 40, sx, sy, IM_COL32(224, 190, 111, 255), serif, 24);
         skin_text("Fan project, not affiliated with Nintendo. Requires your own legally obtained game copy.",
-                  202, 120, 890, 32, sx, sy, IM_COL32(199, 201, 204, 255), font, 21);
+                  202, 120, 1200, 34, sx, sy, IM_COL32(199, 201, 204, 255), font, 24);
         ImU32 state_col = busy ? IM_COL32(114, 219, 240, 255) : ready ? IM_COL32(227, 198, 107, 255) : IM_COL32(242, 181, 84, 255);
         const char *state_label = busy ? "Working" : ready ? "This app is ready" : "Setup needed";
-        skin_text(state_label, 202, 153, 540, 34, sx, sy, state_col, font, 23);
-        if (g_dev && update_from.empty()) skin_text("Development build - local tools", 747, 153, 300, 28, sx, sy, IM_COL32(136, 214, 237, 255), font, 21);
-        else if (g_checking) skin_text("Checking for updates...", 747, 153, 300, 28, sx, sy, IM_COL32(214, 219, 219, 255), font, 21);
-        else if (rel.newer) skin_text(("Update available: " + version_label(rel.version)).c_str(), 747, 153, 300, 28, sx, sy, IM_COL32(255, 216, 122, 255), font, 21);
+        skin_text(state_label, 202, 153, 540, 34, sx, sy, state_col, font, 24);
+        if (g_dev && update_from.empty()) skin_text("Development build - local tools", 747, 153, 360, 32, sx, sy, IM_COL32(136, 214, 237, 255), font, 24);
+        else if (g_checking) skin_text("Checking for updates...", 747, 153, 360, 32, sx, sy, IM_COL32(214, 219, 219, 255), font, 24);
+        else if (rel.newer) skin_text(("Update: " + version_label(rel.version)).c_str(), 747, 153, 360, 32, sx, sy, IM_COL32(255, 216, 122, 255), font, 24);
 
         skin_text("YOUR GAME FILES", 370, 200, 250, 34, sx, sy, IM_COL32(245, 220, 163, 255), serif, 23, true);
         const std::string source_line = src.empty() ? (have_files ? g_paths.data : "Choose a game folder or package") : src;
-        skin_text(source_line.c_str(), 176, 245, 640, 40, sx, sy, IM_COL32(248, 237, 211, 255), font, 22);
+        skin_text(source_line.c_str(), 176, 245, 640, 42, sx, sy, IM_COL32(248, 237, 211, 255), font, 24);
         const char *base_state = source_ok || (have_files && src.empty()) ? "OK" : "Not selected";
         skin_text((std::string("Base Game: ") + base_state).c_str(), 178, 292, 585, 32, sx, sy,
                   source_ok || (have_files && src.empty()) ? IM_COL32(84, 232, 207, 255) : IM_COL32(226, 213, 177, 255), font, 24);
         std::string update_file = upd;
         size_t update_leaf = update_file.find_last_of("/\\");
         if (update_leaf != std::string::npos) update_file = update_file.substr(update_leaf + 1);
-        std::string update_line = upd.empty() ? "Update Candidate: optional; auto-detected" : "Update Candidate: " + update_file;
-        skin_text(update_line.c_str(), 178, 331, 435, 42, sx, sy, IM_COL32(245, 230, 194, 255), font, 21);
-        skin_text(val.running ? "prod.keys: checking..." : val_current && val.ok ? "prod.keys: valid" : val_current && !val.ok ? "prod.keys: check failed" : "prod.keys: checked during Recompile",
+        std::string update_line = upd.empty() ? "Update: optional; auto-detected" : "Update: " + update_file;
+        skin_text(update_line.c_str(), 178, 331, 410, 42, sx, sy, IM_COL32(245, 230, 194, 255), font, 24);
+        skin_text(val.running ? "prod.keys: checking..." : val_current && val.ok ? "prod.keys: valid" : val_current && !val.ok ? "prod.keys: check failed" : "prod.keys: checked during game setup",
                   178, 375, 620, 32, sx, sy, val_current && val.ok ? IM_COL32(84, 232, 207, 255) : IM_COL32(242, 226, 191, 255), font, 24);
 
         static const SDL_DialogFileFilter filters[] = {{"Game package", "xci;nsp;nca"}};
         static const SDL_DialogFileFilter update_filters[] = {{"Game update", "nsp"}};
-        if (skin_button("CHOOSE GAME FOLDER...", "##pick-folder", 168, 422, 316, 65, sx, sy, !busy, serif, 20))
+        if (skin_button("CHOOSE GAME FOLDER...", "##pick-folder", 168, 422, 316, 65, sx, sy, !busy, serif, 24))
             SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
-        if (skin_button("CHOOSE XCI / NSP...", "##pick-package", 516, 422, 302, 65, sx, sy, !busy, serif, 20))
+        if (skin_button("CHOOSE XCI / NSP...", "##pick-package", 516, 422, 302, 65, sx, sy, !busy, serif, 24))
             SDL_ShowOpenFileDialog(picked, NULL, win, filters, 1, NULL, false);
-        if (skin_button(upd.empty() ? "SET UPDATE NSP" : "REPLACE UPDATE NSP", "##pick-update", 620, 331, 175, 38, sx, sy, !busy, font, 17, IM_COL32(105, 212, 197, 255)))
+        if (skin_button("UPDATE NSP", "##pick-update", 596, 331, 174, 42, sx, sy, !busy, font, 24, IM_COL32(105, 212, 197, 255)))
             SDL_ShowOpenFileDialog(picked_update, NULL, win, update_filters, 1, NULL, false);
-        if (!upd.empty() && skin_button("REMOVE", "##remove-update", 796, 331, 48, 38, sx, sy, !busy, font, 12, IM_COL32(255, 151, 125, 255))) {
+        if (!upd.empty() && skin_button("CLEAR", "##remove-update", 776, 331, 76, 42, sx, sy, !busy, font, 24, IM_COL32(255, 151, 125, 255))) {
             g_config.erase("update"); config_save(); start_validation(g_config["source"], "");
         }
 
-        const char *main_action = busy ? "WORKING" : need_update && !ready ? "UPDATE & RECOMPILE" : "PLAY";
+        const char *main_action = busy ? "WORKING" : "PLAY";
         if (skin_button(main_action, "##main-action", 1055, 204, 412, 111, sx, sy,
-                        !busy && (ready || (need_update && (rel.required || !ready))), display, 52,
+                        !busy && ready, display, 52,
                         IM_COL32(69, 48, 17, 255))) {
-            if (ready) { if (play(play_error)) quit = !g_dev; }
-            else if (need_update && (rel.required || !ready)) start_workflow(true);
+            if (play(play_error)) quit = !g_dev;
         }
         if (busy) {
-            if (skin_button("CANCEL", "##cancel", 979, 336, 272, 63, sx, sy, true, serif, 21)) cancel();
+            if (skin_button("CANCEL", "##cancel", 979, 336, 272, 63, sx, sy, true, serif, 24)) cancel();
         } else {
-            if (skin_button("RECOMPILE", "##recompile", 979, 336, 272, 63, sx, sy, !busy && can_build, serif, 21)) start_workflow(false);
-            if (skin_button("PREPARE SHADERS", "##prepare-shaders", 1269, 336, 274, 63, sx, sy, !busy && ready, serif, 19,
+            const char *build_action = need_update ? "UPDATE" : "RECOMPILE";
+            if (skin_button(build_action, "##recompile", 979, 336, 272, 63, sx, sy, !busy && (need_update || can_build), serif, 24))
+                start_workflow(need_update);
+            if (skin_button("PREPARE SHADERS", "##prepare-shaders", 1269, 336, 274, 63, sx, sy, !busy && ready, serif, 24,
                             IM_COL32(185, 249, 244, 255))) start_shaders_workflow();
         }
         if (need_update && ready) {
-            std::string update_label = "Update available: " + version_label(rel.version) + " (click to install)";
-            if (skin_button(update_label.c_str(), "##install-update", 1000, 411, 560, 44, sx, sy, true, font, 18, IM_COL32(247, 204, 103, 255)))
+            std::string update_label = "Update available: " + version_label(rel.version);
+            if (skin_button(update_label.c_str(), "##install-update", 1000, 411, 560, 44, sx, sy, true, font, 24, IM_COL32(247, 204, 103, 255)))
                 start_workflow(true);
         } else {
             const char *summary_line = busy ? (status.empty() ? "Working..." : status.c_str()) : ready ? "Ready to play"
-                                     : need_update ? "An update is available" : "Choose Recompile to build the game";
+                                     : need_update ? "Choose Update to install the latest version" : "Choose Recompile to build the game";
             skin_text(summary_line, 1090, 411, 500, 44, sx, sy,
                       ready ? IM_COL32(218, 230, 143, 255) : IM_COL32(255, 218, 147, 255), font, 27);
         }
         std::string summary = shader_summary();
         if (summary.empty()) summary = g_dev && update_from.empty() ? "Development build: shader preparation status appears here" : "Vulkan device, pipelines and SPIR-V shader status";
-        canvas->AddRectFilled(skin_point(1102, 461, sx, sy), skin_point(1564, 506, sx, sy), IM_COL32(8, 32, 39, 205), 8.0f * std::min(sx, sy));
-        skin_text(summary.c_str(), 1117, 467, 432, 34, sx, sy, IM_COL32(139, 241, 244, 255), font, 21);
+        canvas->AddRectFilled(skin_point(1102, 457, sx, sy), skin_point(1564, 528, sx, sy), IM_COL32(8, 32, 39, 205), 8.0f * std::min(sx, sy));
+        skin_text(summary.c_str(), 1117, 461, 432, 63, sx, sy, IM_COL32(139, 241, 244, 255), font, 24);
 
         ImGui::SetCursorPos(ImVec2(86 * sx, 555 * sy));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -1971,10 +1978,10 @@ int main(int argc, char **argv) {
         ImGui::PopStyleColor();
         if (step_font) ImGui::PopFont();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Show the detailed build and shader log");
-        if (skin_button("OPEN LOGS FOLDER", "##open-logs", 350, 865, 270, 58, sx, sy, true, serif, 20)) {
+        if (skin_button("OPEN LOGS FOLDER", "##open-logs", 350, 865, 270, 58, sx, sy, true, serif, 24)) {
             CreateDirectoryW(widen(g_paths.logs()).c_str(), NULL); open_folder(g_paths.logs());
         }
-        if (skin_button("OPEN DATA FOLDER", "##open-data", 650, 865, 266, 58, sx, sy, true, serif, 20)) open_folder(g_paths.data);
+        if (skin_button("OPEN DATA FOLDER", "##open-data", 650, 865, 266, 58, sx, sy, true, serif, 24)) open_folder(g_paths.data);
         ImGui::End();
         ImGui::PopStyleVar();
         ImGui::Render();

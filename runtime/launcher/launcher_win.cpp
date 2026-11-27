@@ -1153,10 +1153,11 @@ static void reset_steps(bool with_update) {
     std::lock_guard<std::mutex> l(g_mu);
     g_steps.clear();
     if (with_update) g_steps.push_back({"update", "Updating Trirod tools"});
-    g_steps.push_back({"files", "Preparing game files"});
-    g_steps.push_back({"translate", "Translating game code for PC"});
-    g_steps.push_back({"compile", "Compiling and linking the generated code"});
-    g_steps.push_back({"shaders", "Preparing shaders for the graphics device"});
+    // (the same names as the idle list the window shows before a build: the player sees one list either way)
+    g_steps.push_back({"files", "1. Reading your game files"});
+    g_steps.push_back({"translate", "2. Translating game code for PC"});
+    g_steps.push_back({"compile", "3. Compiling and linking the generated code"});
+    g_steps.push_back({"shaders", "4. Preparing shaders for the graphics device"});
     g_log.clear();
     g_error.clear();
 }
@@ -1253,7 +1254,8 @@ static void workflow(bool update_first, Release rel) {
     struct Run { const char *label; std::vector<std::string> argv; };
     std::vector<std::string> files = {g_paths.trbuild(), "files", "--data", g_paths.data};
     if (!source.empty()) files.insert(files.end(), {"--source", source});
-    if (!source.empty() && !update.empty()) files.insert(files.end(), {"--update", update});
+    // (the update goes even with no source: trbuild refuses it with why, instead of building the old version)
+    if (!update.empty()) files.insert(files.end(), {"--update", update});
     if (!source.empty() && file_exists(g_config["keys"])) files.insert(files.end(), {"--keys", g_config["keys"]});
     Run runs[] = {
         {"trbuild files", files},
@@ -1300,7 +1302,7 @@ static Validation g_valid;
 static void validate(std::string source, std::string update) {
     std::vector<std::string> argv = {g_paths.trbuild(), "check", "--data", g_paths.data};
     if (!source.empty()) argv.insert(argv.end(), {"--source", source});
-    if (!source.empty() && !update.empty()) argv.insert(argv.end(), {"--update", update});
+    if (!update.empty()) argv.insert(argv.end(), {"--update", update});  // (alone: trbuild says it needs the base)
     if (!source.empty() && file_exists(g_config["keys"])) argv.insert(argv.end(), {"--keys", g_config["keys"]});
     ToolResult r = run_tool("trbuild check", argv, g_paths.data);
     std::lock_guard<std::mutex> l(g_mu);
@@ -1402,6 +1404,10 @@ static int prepare_mode(const std::string &source, const std::string &update, co
     if (!single_instance(0)) return fail("Trirod Launcher is open for this game: close it, then set up again");
     ToolsInfo tools = read_tools();
     if (!tools.present) return fail("the build tools are missing (" + tools.why + "): reinstall the game");
+    // (an update alone was dropped here and the old extraction rebuilt: it patches the base package's own data, so it
+    // can't be applied to extracted\; trbuild says the same for the window, UPDATE_NEEDS_BASE)
+    if (source.empty() && !update.empty())
+        return fail("the update needs the base game package too: pick your base .xci / .nsp together with the update");
     if (!source.empty()) {
         g_config["source"] = source;
         g_config["update"] = update;
@@ -1911,7 +1917,9 @@ int main(int argc, char **argv) {
 
     ToolsInfo tools = read_tools();
     Uint64 tools_read_at = SDL_GetTicks();
-    if (tools.present && (!g_config["source"].empty() || file_exists(g_paths.extracted() + "\\exefs\\main")))
+    // (an update chosen alone is checked too: the check is what says it needs its base package)
+    if (tools.present && (!g_config["source"].empty() || !g_config["update"].empty() ||
+                          file_exists(g_paths.extracted() + "\\exefs\\main")))
         start_validation(g_config["source"], g_config["update"]);
     if ((!g_dev && !recomplauncher) || !update_from.empty()) {  // (--update-from: a release on disk, also in development mode)
         g_checking = true;
@@ -1922,7 +1930,8 @@ int main(int argc, char **argv) {
             g_checking = false;
         }).detach();
     }
-    bool show_details = true, quit = false, follow = true;
+    // (details off at start: the panel then shows the next step to take, not an empty log; a build turns them on)
+    bool show_details = false, quit = false, follow = true;
     std::string play_error;
     while (!quit) {
         SDL_Event e;
@@ -1979,6 +1988,7 @@ int main(int argc, char **argv) {
         {   // (after a build, check again: the state shown must be the new extraction's)
             static bool was_busy;
             if (was_busy && !busy) start_validation(g_config["source"], g_config["update"]);
+            if (!was_busy && busy) show_details = true;  // (a build shows its log as it goes)
             was_busy = busy;
         }
         bool need_update = ((!g_dev && !recomplauncher) || !update_from.empty()) && rel.ok && rel.newer;
@@ -1986,15 +1996,20 @@ int main(int argc, char **argv) {
             auto_update = false;
             if (need_update) start_workflow(true);
         }
-        bool can_build = tools.present && (source_ok || (have_files && src.empty()));
+        // (extracted files alone can be rebuilt; with an update chosen too they can't: the update needs its base package)
+        bool can_build = tools.present && (source_ok || (have_files && src.empty() && upd.empty()));
         if (auto_recompile && !busy && can_build) auto_recompile = false, start_workflow(false);
         if (auto_shaders && !busy && ready) auto_shaders = false, start_shaders_workflow();
         std::string headline = !status.empty() && !g_build_ok_once && !error.empty() ? status
                              : ready ? (need_update ? "An update is available" : "Ready to play")
                              : !tools.present ? (g_dev ? "Build the local package first (setup/build.ps1)" : "The tools need to be downloaded")
-                             : !can_build ? "Choose your game files"
+                             // (said as the next thing to do: the window is a 1-2-3, choose -> build -> play)
+                             : !can_build ? (val.running ? std::string("Checking your game files...")
+                                             : "Step 1: choose your base game (.xci / .nsp, with prod.keys next to it). "
+                                               "Optional: add the v1.1.0 update with UPDATE NSP.")
                              : need_update ? "Update to install the latest version (" + not_ready + ")"
-                             : "Recompile to build the game for this version (" + not_ready + ")";
+                             : "Step 2: press BUILD GAME (it takes a while, once per version). Then PLAY. (" +
+                                   not_ready + ")";
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -2030,9 +2045,18 @@ int main(int argc, char **argv) {
         std::string update_file = upd;
         size_t update_leaf = update_file.find_last_of("/\\");
         if (update_leaf != std::string::npos) update_file = update_file.substr(update_leaf + 1);
-        std::string update_line = upd.empty() ? "Update: optional; auto-detected" : "Update: " + update_file;
+        std::string update_line = upd.empty() ? "Update (optional): none chosen" : "Update: " + update_file;
         skin_text(update_line.c_str(), 178, 331, 410, 42, sx, sy, IM_COL32(245, 230, 194, 255), font, 24);
-        skin_text(val.running ? "prod.keys: checking..." : val_current && val.ok ? "prod.keys: valid" : val_current && !val.ok ? "prod.keys: check failed" : "prod.keys: checked during game setup",
+        // (a failed check is not necessarily the keys: an unsupported version or an update without its base fail the
+        // same check, so this says "keys" only when the reason does, and the reason itself is shown under Next step.
+        // An ok check names "base game ..." for packages, read with the keys, and "extracted game files" without them.)
+        bool keys_named = val.text.find("keys") != std::string::npos || val.text.find("decrypt") != std::string::npos ||
+                          val.text.find("ticket") != std::string::npos;
+        std::string keys_line = val.running ? "prod.keys: checking..."
+                              : !val_current ? "prod.keys: checked when you build"
+                              : val.ok ? (val.text.rfind("base game", 0) == 0 ? "prod.keys: OK" : "prod.keys: not needed (extracted files)")
+                              : keys_named ? "prod.keys: problem (see Next step)" : "prod.keys: not checked yet (see Next step)";
+        skin_text(keys_line.c_str(),
                   178, 375, 620, 32, sx, sy, val_current && val.ok ? IM_COL32(84, 232, 207, 255) : IM_COL32(242, 226, 191, 255), font, 24);
 
         static const SDL_DialogFileFilter filters[] = {{"Game package", "xci;nsp;nca"}};
@@ -2056,7 +2080,7 @@ int main(int argc, char **argv) {
         if (busy) {
             if (skin_button("CANCEL", "##cancel", 979, 336, 272, 63, sx, sy, true, serif, 24)) cancel();
         } else {
-            const char *build_action = need_update ? "UPDATE" : "RECOMPILE";
+            const char *build_action = need_update ? "UPDATE" : "BUILD GAME";
             if (skin_button(build_action, "##recompile", 979, 336, 272, 63, sx, sy, !busy && (need_update || can_build), serif, 24))
                 start_workflow(need_update);
             if (skin_button("PREPARE SHADERS", "##prepare-shaders", 1269, 336, 274, 63, sx, sy, !busy && ready, serif, 24,
@@ -2068,7 +2092,8 @@ int main(int argc, char **argv) {
                 start_workflow(true);
         } else {
             const char *summary_line = busy ? (status.empty() ? "Working..." : status.c_str()) : ready ? "Ready to play"
-                                     : need_update ? "Choose Update to install the latest version" : "Choose Recompile to build the game";
+                                     : need_update ? "Choose Update to install the latest version"
+                                     : can_build ? "Next: press BUILD GAME" : "Next: choose your game files";
             skin_text(summary_line, 1090, 411, 500, 44, sx, sy,
                       ready ? IM_COL32(218, 230, 143, 255) : IM_COL32(255, 218, 147, 255), font, 27);
         }
@@ -2084,7 +2109,7 @@ int main(int argc, char **argv) {
         if (step_font) ImGui::PushFont(step_font);
         if (steps.empty()) {
             static const std::vector<Step> idle_steps = {
-                {"files", "Preparing game files"},
+                {"files", "1. Reading your game files"},
                 {"translate", "2. Translating game code for PC"},
                 {"compile", "3. Compiling and linking the generated code"},
                 {"shaders", "4. Preparing shaders for the graphics device"}
@@ -2101,6 +2126,12 @@ int main(int argc, char **argv) {
         if (log_font) ImGui::PushFont(log_font);
         ImGui::BeginChild("##skin-log", ImVec2(548 * sx, 280 * sy), ImGuiChildFlags_None,
                           ImGuiWindowFlags_NoBackground);
+        if (!busy && val_current && !val.ok) {  // (first, in both views: it is what the player must fix before anything)
+            ImGui::PushTextWrapPos();
+            ImGui::TextColored(ImVec4(1, 0.48f, 0.40f, 1), "Can't use the chosen files: %s", val.text.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+        }
         if (show_details) {
             for (int i = 0; i < (int)log.size(); ++i) {
                 const LogLine &l = log[(size_t)i];

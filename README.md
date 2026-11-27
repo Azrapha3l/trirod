@@ -27,8 +27,8 @@ The Windows release is distributed as a tools package. The package contains the 
 1. Download `TriRod-<version>-Windows-x64.zip` from [Trirod Releases](https://github.com/Azrapha3l/trirod/releases/latest).
 2. Extract the **entire ZIP** to a writable folder of your choice. Keep the launcher, tools, and DLLs together in that folder.
 3. Run `Trirod-Launcher.exe`.
-4. In the launcher, choose the folder containing your game files, or choose your `.xci` / `.nsp` package. If you select a package, place `prod.keys` beside it.
-5. Select **Recompile**. The launcher shows progress while it prepares the game files, translates and compiles the game code, links the runtime, and prepares shaders for your graphics device.
+4. In the launcher, choose the folder containing your game files, or choose your `.xci` / `.nsp` package. If you select a package, place `prod.keys` beside it. To play v1.1.0, also choose the update with **Update NSP**: an update is always applied together with the base `.xci` / `.nsp`, never to files that were already extracted.
+5. Select **Build Game**. The launcher shows progress while it reads the game files, translates and compiles the game code, links the runtime, and prepares shaders for your graphics device. If something is wrong with the chosen files, the reason is shown under *Next step*.
 6. When the build finishes, select **Play**.
 
 The first build can take a while. The generated game code and device-specific shader/pipeline caches are kept locally. They are not uploaded to Trirod or included in releases.

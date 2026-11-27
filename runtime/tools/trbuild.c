@@ -106,6 +106,13 @@ static const char *game_version(const char *main_path) {
 }
 
 #define NEEDS_LOCAL_EXTRACTION "the game data still needs local extraction"
+// An update NSP's RomFS is a relocation table over the base NCA's encrypted, compressed section (nxpkg.c patch_load),
+// not over the decrypted romfs.bin / romfs folder an extraction leaves: it can only be applied with the base package.
+// (A player who had extracted v1.0.0 and added only the update saw this as "prod.keys: check failed".)
+#define UPDATE_NEEDS_BASE                                                                                              \
+    "an update NSP needs the base game package too: choose the base .xci / .nsp (or a folder with both) together "    \
+    "with the update. Already extracted game files can't be updated, because the update patches the base package's " \
+    "own data"
 
 // The extracted files (not the game code): NULL = there and the supported version, else what is wrong
 static const char *extracted_state(void) {
@@ -272,7 +279,7 @@ static bool classify(Found *g, char *why, size_t n) {
     }
     if (g->base_ver < 0) {
         if (unknown_base[0]) snprintf(why, n, "the base game package %s isn't v1.0.0, the base version this build supports", unknown_base);
-        else if (any_update) snprintf(why, n, "an update needs its base game: choose the folder with both, or the base .xci / .nsp");
+        else if (any_update) snprintf(why, n, "%s", UPDATE_NEEDS_BASE);
         else if (other_title) snprintf(why, n, "these packages aren't The Legend of Zelda: Echoes of Wisdom");
         else snprintf(why, n, "%s", first_error[0] ? first_error : "no game package could be read (check prod.keys)");
         return false;
@@ -290,6 +297,8 @@ static bool classify(Found *g, char *why, size_t n) {
 // NULL = usable (desc says what was found), else why not. Packages are identified by their contents here.
 static const char *judge(Found *g, char *desc, size_t n) {
     if (g->exefs[0] && g->romfs[0]) {
+        // (an update chosen beside extracted files was ignored here before: the import then kept the old version)
+        if (g->update_arg[0]) return UPDATE_NEEDS_BASE;
         char main[1200];
         snprintf(main, sizeof main, "%s/main", g->exefs);
         const char *version = game_version(main);
@@ -371,6 +380,7 @@ static int cmd_check(const char *source, const char *update) {
     if (!source || !*source) {
         ExtractState st = extraction(NULL, &rec, &have_rec, &matches, why, sizeof why);
         report_extraction(st, why);
+        if (update && *update) { tp_event("check bad %s", UPDATE_NEEDS_BASE); return 1; }
         const char *bad = extracted_state();
         if (bad) { tp_event("check bad %s", bad); return 1; }
         char main[1200];
@@ -482,6 +492,7 @@ static int cmd_files(const char *source, const char *update, bool force) {
     ImportRecord rec, want;
     bool have_rec = false, matches = false;
     if (!source || !*source) {  // nothing chosen: the files already there (the earlier behaviour)
+        if (update && *update) return fail(UPDATE_NEEDS_BASE);
         const char *state = extracted_state();
         if (!state) {
             tp_event("info Game files already prepared in %s/%s", rt_data_root(), GAME_DIR);

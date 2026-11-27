@@ -34,12 +34,17 @@ files, `Trirod.dll`, `shader_catalog\`, `.gamebuild\`), `Trirod.exe`, `cache\` (
 The launcher checks `tools\trirod-tools.json` (version, `gamelib_id`, `gamebuild_id`) against the built game:
 
 - **Built for this version:** `extracted\Trirod.dll.id` equals `gamelib_id`, `Trirod.exe.id` equals `gamebuild_id`,
-  and `extracted\exefs\main` and `romfs.bin` exist. Then **Play** is shown, with **Recompile** as a secondary action.
-  Otherwise the launcher shows **Recompile** and the reason, for example "Trirod.exe was built from another runtime".
+  and `extracted\exefs\main` and `romfs.bin` exist. Then **Play** is shown, with **Build Game** (the recompile) as a
+  secondary action. Otherwise the launcher shows **Build Game** and the reason, for example "Trirod.exe was built from
+  another runtime". The *Next step* panel says what to do as a numbered step (1: choose the game, 2: Build Game).
 - **Game files:** **Choose game folder…** or **Choose .xci / .nsp…** stores the path in `trirod-launcher.ini` and runs
-  `trbuild check`. **Recompile** is enabled only when the check passes, or when valid extracted files are already
-  present. For a package, `prod.keys` must sit beside it. Its title and build ID are checked during *Preparing game
-  files* because they are inside the encrypted package.
+  `trbuild check`. **Build Game** is enabled only when the check passes, or when valid extracted files are already
+  present and no update is chosen. For a package, `prod.keys` must sit beside it. A failed check shows its own reason
+  under *Next step*; the `prod.keys:` line says "problem" only when that reason is about the keys (an unsupported
+  version or an update without its base used to show as "prod.keys: check failed").
+- **Update NSP:** always applied with the base package (`trbuild` refuses it beside extracted files or with no source:
+  the update's RomFS relocates the base NCA's own encrypted data, not `romfs.bin`). A personalized ticket (title key
+  type 1) is reported as such instead of decrypting with a wrong key.
 - **Updates (release builds):** the launcher sends a GET to `https://api.github.com/repos/<UPDATE_REPO>/releases/latest`.
   It downloads the release's `trirod-release.json` asset and compares its `version` with the installed tools, using
   the order `alpha_<n>` < `beta_<n>` < `v<x.y.z>`. A newer release is marked as requiring a recompile when its

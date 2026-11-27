@@ -360,7 +360,24 @@ static void dl_note(const char *fmt, ...) {
     va_end(ap);
 }
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note("  upload %p %ux%u lv%u", img, w, h, lv); }
+// EOWRECOMP_VK_CHECKPOINTS=1 (device.c): marker n names the draw / dispatch in cp_ring[n % 8192]. Commands recorded
+// since the last submission are at most a few thousand, so the ring still holds what the faulting submission did.
+static char cp_ring[8192][96];
+static uint64_t cp_seq;
+void vk_checkpoint(VkCommandBuffer cb, const char *fmt, ...) {
+    if (!vk_checkpoint_fn) return;
+    uint64_t n = ++cp_seq;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cp_ring[n & 8191], sizeof cp_ring[0], fmt, ap);
+    va_end(ap);
+    vk_checkpoint_fn(cb, (const void *)(uintptr_t)n);
+}
+const char *vk_checkpoint_name(uint64_t seq) {
+    return seq && seq <= cp_seq && cp_seq - seq < 8192 ? cp_ring[seq & 8191] : "(not in the ring)";
+}
 void vk_devlost_dump(void) {
+    vk_checkpoint_report();
     if (!dl_on) return;
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
     for (unsigned i = dl_n > 64 ? dl_n - 64 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 63]);
@@ -4372,6 +4389,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
             (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
+    vk_checkpoint(cb, "dispatch %ux%ux%u cs %llx", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr);
     nfeedback = 0;
     if (ct_on()) {
         LOG("[ct] dispatch cs %llx %ux%ux%u | tex", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz);
@@ -4738,6 +4756,23 @@ static void trace_draw(Prog *pr, CmdRec *r, bool indexed) {
         LOG("[trace]   vbuf%d %llx+%llx stride %u%s\n", i, (unsigned long long)v.addr, (unsigned long long)v.size, st.stream[i][0],
             gstore_overlaps(v.addr, v.addr + v.size) ? " (may be written by a shader in flight)" : "");
     }
+    if (indexed && r->x[3] >= HEAP_BASE) {  // index range (CMD_DRAW_ELEMENTS {mode, type, count, address, base vertex, ...})
+        uint32_t type = (uint32_t)r->x[1], n = (uint32_t)r->x[2], lo = UINT32_MAX, hi = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t v = type == 0 ? ((const uint8_t *)(uintptr_t)r->x[3])[i] : type == 1 ? ((const uint16_t *)(uintptr_t)r->x[3])[i]
+                                                                                       : ((const uint32_t *)(uintptr_t)r->x[3])[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        LOG("[trace]   indices %llx type %u count %u: %u..%u, base vertex %d\n", (unsigned long long)r->x[3], type, n, lo, hi,
+            (int)(int64_t)r->x[4]);
+    }
+    for (int i = 0; i < 32; i++) {  // the vertex attributes the VS reads: NVN format, stream, offset (draw_'s PipeKey)
+        if (!(pr->vi->attr_mask & (1u << i))) continue;
+        uint32_t a = i < st.nattrib ? st.attrib[i] : 0;
+        LOG("[trace]   attr%d nvn fmt %#x stream %u offset %u divisor %u -> vk fmt %d\n", i, a & 0xFF, (a >> 8) & 0x1F, a >> 13,
+            ((a >> 8) & 0x1F) < (uint32_t)st.nstream ? st.stream[(a >> 8) & 0x1F][1] : 0, (int)vertex_format(a & 0xFF));
+    }
 }
 
 // Called for every draw that reaches recording: numbers it, and logs the opt-in traces. Also notes the NVN alpha test
@@ -4892,6 +4927,19 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { SKIP(SKIP_LIST); return; }
+        // EOWRECOMP_SKIP_FS=<hex>[,<hex>...] (debug): skip draws whose VS or FS code address is listed (the addresses
+        // the draw checkpoints, labels and EOWRECOMP_VK_TRACE_FS name), to tell which of them faults
+        static uint64_t skip_addr[8];
+        static int nskip_addr = -1;
+        if (nskip_addr < 0) {
+            nskip_addr = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_FS"); p && *p && nskip_addr < 8;) {
+                skip_addr[nskip_addr++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        for (int i = 0; i < nskip_addr; i++)
+            if (skip_addr[i] && (skip_addr[i] == fs || skip_addr[i] == st.program->stages[0].code_addr)) { SKIP(SKIP_LIST); return; }
         if (g_debug_frame && getenv("EOWRECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
@@ -4946,6 +4994,12 @@ static void draw_(CmdRec *r, bool indexed) {
         VkDebugUtilsLabelEXT label = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name};
         vk_draw_label_fn(cb, &label);
     }
+    // (CMD_DRAW_ELEMENTS {mode, type, count, index address, base vertex, base instance, instances};
+    //  CMD_DRAW_ARRAYS {mode, first, count, base instance, instances})
+    vk_checkpoint(cb, "draw f%llu #%u vs=%llx fs=%llx %ux%u mode %u count %u inst %u%s", (unsigned long long)diag_frame, diag_draw,
+                  (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
+                  st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0,
+                  (unsigned)r->x[0], (unsigned)r->x[2], (unsigned)(indexed ? r->x[6] : r->x[4]), indexed ? " indexed" : "");
 
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;

@@ -54,6 +54,12 @@ typedef struct {
 extern VkG g_vk;
 // EOWRECOMP_VK_DRAW_LABELS=1 (device.c): vkCmdInsertDebugUtilsLabelEXT, or NULL when off / unavailable
 extern PFN_vkCmdInsertDebugUtilsLabelEXT vk_draw_label_fn;
+// EOWRECOMP_VK_CHECKPOINTS=1 (device.c): vkCmdSetCheckpointNV, or NULL when off / unavailable. exec.c sets one per draw
+// and dispatch (vk_checkpoint) and names them (vk_checkpoint_name); vk_checkpoint_report logs them after a device loss.
+extern PFN_vkCmdSetCheckpointNV vk_checkpoint_fn;
+void vk_checkpoint(VkCommandBuffer cb, const char *fmt, ...);
+const char *vk_checkpoint_name(uint64_t seq);
+void vk_checkpoint_report(void);
 // Folder of the shader / pipeline caches (device.c): EOWRECOMP_CACHE_DIR, default "cache" in the data folder
 const char *vk_cache_dir(void);
 // A rectangle of the window (x, y, w, h) in the swapchain image's own coordinates (pre-rotation: device.c)

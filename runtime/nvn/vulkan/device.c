@@ -21,6 +21,8 @@
 
 VkG g_vk;
 PFN_vkCmdInsertDebugUtilsLabelEXT vk_draw_label_fn;
+PFN_vkCmdSetCheckpointNV vk_checkpoint_fn;
+static PFN_vkGetQueueCheckpointDataNV checkpoint_data_fn;
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
@@ -223,6 +225,31 @@ void vk_device_fault_report(void) {
             (unsigned long long)vend[i].vendorFaultData);
 }
 
+// After VK_ERROR_DEVICE_LOST with EOWRECOMP_VK_CHECKPOINTS: the last checkpoint the GPU reached at each pipeline stage
+// it reports (top of pipe: the command had started; bottom of pipe: it had finished). The markers are sequence numbers
+// whose descriptions exec.c keeps (vk_checkpoint_name).
+void vk_checkpoint_report(void) {
+    static int once;
+    if (once++ || !checkpoint_data_fn) return;
+    uint32_t n = 0;
+    checkpoint_data_fn(g_vk.queue, &n, NULL);
+    VkCheckpointDataNV cp[16];
+    if (n > 16) n = 16;
+    for (uint32_t i = 0; i < n; i++) cp[i] = (VkCheckpointDataNV){.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV};
+    checkpoint_data_fn(g_vk.queue, &n, cp);
+    LOG("[vk] checkpoints reached before the device loss: %u\n", n);
+    uint64_t lo = UINT64_MAX, hi = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t seq = (uint64_t)(uintptr_t)cp[i].pCheckpointMarker;
+        if (seq < lo) lo = seq;
+        if (seq > hi) hi = seq;
+        LOG("[vk]   stage %#x: checkpoint %llu %s\n", (unsigned)cp[i].stage, (unsigned long long)seq, vk_checkpoint_name(seq));
+    }
+    // the commands between the last finished and the last started one were in flight: one of them hung or faulted
+    for (uint64_t s = lo + 1; n > 1 && s < hi && s - lo <= 32; s++)
+        LOG("[vk]   in flight: checkpoint %llu %s\n", (unsigned long long)s, vk_checkpoint_name(s));
+}
+
 // ---- pipeline cache identity: <cache>/vk_pipelines.tag
 // vk_pipelines.bin starts with the driver's header: vendor, device and pipelineCacheUUID (which changes with the
 // driver). Vulkan ignores incompatible data by itself; it is checked here as well so the reason can be told. The tag
@@ -335,6 +362,13 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+    // EOWRECOMP_VK_CHECKPOINTS=1: a marker before every draw and dispatch (VK_NV_device_diagnostic_checkpoints); after
+    // a device loss the driver says which markers the GPU had reached (vk_checkpoint_report). VK_EXT_device_fault only
+    // gives a GPU address ("ip invalid" for the Jabu-Jabu splash hang), and submitting each pass on its own moved the
+    // hang elsewhere; this names the draw without changing the submissions.
+    bool checkpoints = getenv("EOWRECOMP_VK_CHECKPOINTS") && has_ext(ep, ne, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+    if (checkpoints) ext[n_ext++] = VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
+    else if (getenv("EOWRECOMP_VK_CHECKPOINTS")) LOG("[vk] EOWRECOMP_VK_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints unavailable\n");
     VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have12};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
@@ -433,6 +467,12 @@ static void create_device(void) {
     volkLoadDevice(g_vk.dev);
 #endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    if (checkpoints) {
+        vk_checkpoint_fn = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(g_vk.dev, "vkCmdSetCheckpointNV");
+        checkpoint_data_fn = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(g_vk.dev, "vkGetQueueCheckpointDataNV");
+        if (!checkpoint_data_fn) vk_checkpoint_fn = NULL;
+        LOG("[vk] EOWRECOMP_VK_CHECKPOINTS: draw checkpoints %s\n", vk_checkpoint_fn ? "on" : "unavailable");
+    }
     LOG("[vk] graphics pipeline libraries: %s%s\n", g_vk.graphics_pipeline_library ? "enabled" : "unavailable",
         g_vk.graphics_pipeline_library ? (g_vk.gpl_fast_linking ? " (fast linking reported)" : " (fast linking not reported)") : "; using monolithic pipelines");
 

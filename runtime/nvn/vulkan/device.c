@@ -257,9 +257,11 @@ void vk_checkpoint_report(void) {
 // Scheme 3: shader-stage libraries without RETAIN info, and optimized pipelines that are complete pipelines (exec.c
 // optimize_gpl_pipeline). Older caches are not used: untagged ones can hold link-time-optimized links of libraries
 // without RETAIN (invalid usage; on NVIDIA they drew nothing: the black screen of 2026-11-24), scheme 2 ones hold
-// RETAIN libraries (1.19 GB). When the cache wasn't prepared for this GPU and driver, the game writes the reason to
-// <cache>/shaders-stale.txt; the launcher shows it and offers "Prepare shaders".
-#define PIPELINE_SCHEME 3
+// RETAIN libraries (1.19 GB). Scheme 4: GLSL of shaders with branches returns at EXIT (translate.c glsl_finish, the
+// RTX 5060 illegal-instruction fix), so most stage libraries and pipelines of a scheme 3 cache no longer match: prepare
+// again rather than compile them during play. When the cache wasn't prepared for this GPU and driver, the game writes
+// the reason to <cache>/shaders-stale.txt; the launcher shows it and offers "Prepare shaders".
+#define PIPELINE_SCHEME 4
 static bool g_pc_prepared;  // the loaded cache was prepared by Trirod-ShaderPrep for this device and driver
 static bool g_prep_in_game;  // prepare_shaders_in_game: Setup prepared shaders before, but not for this GPU / driver
 static char g_prep_why[320], g_prep_key[160];

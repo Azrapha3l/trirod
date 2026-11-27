@@ -2256,6 +2256,9 @@ static const char *glsl_sampler_type(const ShaderTexture *t) {
 }
 
 // Declarations + entry point around the (rewritten) body; mirrors the MSL assembly in maxwell_translate.
+static char *str_replace_all(const char *src, const char *from, const char *to);
+static void glsl_epilogue(Ctx *c, Str *es, bool dbg, bool tint);
+
 static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
@@ -2359,21 +2362,67 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
+    Str epi = {0};
+    glsl_epilogue(c, &epi, dbg, tint);
     if (any_branch) {
+        // EXIT in a shader with branches: the epilogue, then return - not a flag tested by every later block. With
+        // `exit_now = true; break;` the NVIDIA driver (RTX 5060, Blackwell; 621.14 and 621.40) compiled the Jabu-Jabu
+        // splash particles' vertex shader 72ea507300 into an instruction its SMs reject ("Graphics SM Warp Exception:
+        // Illegal Instruction Encoding" in the system log; the game lost the device). The same SPIR-V runs on an RTX
+        // 4060, and the same shader with returns runs on both. exit_now remains for falling off the last block.
+        char *ret = malloc(strlen(epi.buf ? epi.buf : "") + 32);
+        sprintf(ret, "    {\n%s    return; }", epi.buf ? epi.buf : "");
+        char *b = str_replace_all(body.buf ? body.buf : "", "    exit_now = true; break;", ret);
+        free(ret);
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
         if (c->fwd) {
-            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "%s", b);
             sp(&s, "    exit_now = true;\n  } while (false);\n%s", c->fwd_tail);
         } else {
             sp(&s, "  for (uint guard = 0u; guard < %uu; guard++) {\n  switch (pc) {\n", maxwell_loop_guard);
-            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "%s", b);
             sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
         }
+        free(b);
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
     }
     free(body.buf);
+    sp(&s, "%s}\n", epi.buf ? epi.buf : "");
+    free(epi.buf);
+    info->msl = s.buf;
+    info->attr_mask = c->in_attr_mask;
+    info->out_mask = stage == STAGE_FRAGMENT ? c->omap_target : c->out_attr_mask;
+    free(c->body.buf);
+    free(c);
+    return info;
+}
+
+// Every occurrence of `from` in src replaced by `to` (a new string).
+static char *str_replace_all(const char *src, const char *from, const char *to) {
+    size_t fl = strlen(from), tl = strlen(to), n = 0;
+    for (const char *p = src; (p = strstr(p, from)) != NULL; p += fl) n++;
+    char *out = malloc(strlen(src) + n * (tl > fl ? tl - fl : 0) + 1), *o = out;
+    for (const char *p = src, *q; ; p = q + fl) {
+        q = strstr(p, from);
+        size_t k = q ? (size_t)(q - p) : strlen(p);
+        memcpy(o, p, k);
+        o += k;
+        if (!q) break;
+        memcpy(o, to, tl);
+        o += tl;
+    }
+    *o = 0;
+    return out;
+}
+
+// What runs after the shader's last instruction: the vertex position conventions (flips, depth range) or the
+// fragment outputs from their registers. Also emitted before the return at each EXIT (glsl_finish).
+static void glsl_epilogue(Ctx *c, Str *es, bool dbg, bool tint) {
+    const ShaderKey *key = c->key;
+    int stage = c->stage;
+    Str s = *es;
     if (stage == STAGE_VERTEX) {
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && key->flip_x) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
@@ -2407,13 +2456,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             else sp(&s, "  gl_FragDepth = gl_FragCoord.z;\n");
         }
     }
-    sp(&s, "}\n");
-    info->msl = s.buf;
-    info->attr_mask = c->in_attr_mask;
-    info->out_mask = stage == STAGE_FRAGMENT ? c->omap_target : c->out_attr_mask;
-    free(c->body.buf);
-    free(c);
-    return info;
+    *es = s;
 }
 
 // The code words the translator reads: instruction words up to the self-branch padding after the last EXIT (or a

@@ -1,6 +1,87 @@
 # Status
 
-Atualizado: 2026-11-26 (RecompLauncher support: `recomplauncher.json`, launcher `--prepare` / `--play`, `trbuild --keys`; checked outside RecompLauncher only. Optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+Atualizado: 2026-11-27 (player reports: update NSP without its base now explained instead of "prod.keys: check failed"; Chinese text fixed (zh-Hans / zh-Hant codes, per-type shared fonts), tested in game; launcher wording. Before: RecompLauncher support: `recomplauncher.json`, launcher `--prepare` / `--play`, `trbuild --keys`; checked outside RecompLauncher only. Optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+
+## Player reports (2026-11-27): update NSP / "prod.keys not valid", Chinese shown as Japanese, launcher clarity; tested, not committed
+
+- **"prod.keys isn't valid" with an update NSP.** The keys were not the problem: the launcher printed
+  `prod.keys: check failed` for every failed `trbuild check`, and never showed the reason. The reporter had extracted
+  files and added only the update NSP. An update can't be applied that way: its RomFS relocates the base NCA's own
+  encrypted, compressed section (`nxpkg.c` `patch_load`), not `romfs.bin`.
+  - `trbuild.c`: `UPDATE_NEEDS_BASE` says so, for an update with no source (`check` and `files`), next to extracted
+    files (before, the update was silently ignored there), and in `classify`.
+  - `launcher_win.cpp`: the update is passed even with no source (window, Build Game and `--prepare`, which used to
+    drop it). Build Game is off for extracted files plus an update. The reason is shown in red at the top of the right
+    panel. The `prod.keys:` line says "problem" only when the reason is about keys or a ticket.
+  - `nxpkg.c` `title_key`: reads the ticket's signature type to find its data. A personalized ticket (title key type 1:
+    RSA-encrypted for the buyer's console) is now reported as such ("dump it again with a common ticket"). Before, it
+    gave a wrong key and "ExeFS doesn't decrypt (wrong keys?)". **Not tested on a real personalized ticket** (none
+    available).
+- **Chinese showed Japanese text.** The runtime told the game `zh-CN` / `zh-TW`. The SDK's code -> language table
+  (sdk `f_700c387140`) knows only `zh-Hans` / `zh-Hant`, so neither matched and the game fell back to Japanese.
+  `settings.c` now serves `zh-Hans` / `zh-Hant`; old settings files with `zh-CN` / `zh-TW` are read as the new codes.
+  Then some characters were missing (自'保存 for 自动保存): `pl.c` gave every shared font type the Japanese Standard
+  font. It now loads a font per type: the console dump's file name in `fonts/`, then Microsoft YaHei (Simplified),
+  JhengHei (Traditional) or Malgun Gothic (Korean) on Windows, then Standard. Shared files are loaded once.
+- **Launcher clarity:** the right panel opens on *Next step* (details off; a build turns them on) as a numbered step:
+  "Step 1: choose your base game..." then "Step 2: press BUILD GAME...". RECOMPILE is now **BUILD GAME**. The build steps
+  are numbered the same before and during a build. README and `docs/RELEASE-WORKFLOW.md` updated.
+- **Tested (Windows, Vulkan):** `./setup/build.ps1` passes. `trbuild check` / `files` on synthetic folders: update
+  alone, and unpacked files plus update, give the new message; unpacked files alone still give the version message.
+  Launcher window (scratch data, update only): the reason shows in red under the panel heading (window captures).
+  In game (`<test-install>` v1.1.0 relinked, scratch cache / save / settings): `language = zh-Hans` shows the
+  Simplified file select and load screens with every character (自动保存, 删除, 要读取哪个数据);
+  `language = zh-Hant` shows Traditional (要選擇哪個檔案遊玩？, 自動儲存, 刪除).
+- **Not tested:** Korean with Malgun Gothic (it was served Yu Gothic before), the console font dumps' file names,
+  macOS (no Chinese / Korean host font added there: it still uses Standard), a real personalized ticket, the RecompLauncher
+  `--prepare` refusal.
+- **Still confusing in the launcher (not changed):** the PLAY art looks lit even when it is disabled (it is part of the
+  skin image), and PREPARE SHADERS sits beside BUILD GAME although the build already does it.
+- **What the user should test:** Simplified and Traditional Chinese in the menu (F1 → language, then back to the title),
+  Korean text, and the launcher with an update chosen and no base (the red reason, and Build Game off).
+
+## Jabu-Jabu splash device loss (2026-11-26): found, RTX 5060 (Blackwell) only; NOT fixed; diagnostics added, not committed
+
+Repro (user's report and the dev install): load the "Crossflows Plaza" save, go up one screen; in the cutscene, when
+Jabu-Jabu gets angry and splashes, the GPU hangs about 2 s and the device is lost (`[vk] device fault:` /
+`address ip invalid ...` / `FATAL: vkWaitSemaphores: -4`). The "needs a Vulkan 1.3 driver" text in the error box is
+the generic hint `platform/windows.c` adds to every Vulkan FATAL, not the cause.
+
+- **Where (measured):** scripted runs in the dev install with scratch cache / save / settings (the save restored before
+  every run: the game autosaves, and a run that gets past the cutscene makes later runs start after it).
+  - With the new draw checkpoints the hang is always in the splash particle draws, on the frame after they first
+    appear: vs `72e9947a00` / fs `72ea504b00` finishes; vs `72ea504f00` / fs `72ea506e00` and vs `72ea507300` /
+    fs `72ea509100` are in flight. Skipping both (`EOWRECOMP_SKIP_FS=72ea504f00,72ea507300`) plays past the splash to
+    frame 17 200. Only vs `72ea507300` hangs by itself.
+  - It is the vertex stage: the hang stays when that VS writes an off-screen position (no fragments) and when its FS
+    writes a constant colour.
+  - Same hang with `EOWRECOMP_VK_GPL=0`, `EOWRECOMP_NO_FEEDBACK=1`, `EOWRECOMP_SHADER_GUARD=64`, optimized SPIR-V
+    (`EOWRECOMP_VK_OPT=1`), robustBufferAccess off, compute `72ebdf2e00` skipped, the BC4 / BC5-array textures
+    replaced by dummies, the RGB10A2 SNORM attribute read as R32, no compare sampler, NaN/Inf cleared from the output.
+    Validation layer: no messages.
+  - Bisect by outputs (temporary hooks, removed): it hangs exactly when varying `v2.z` (the sprite-atlas U, also used
+    by `v2.w`'s chain) is computed; cutting any single part of its computation (integer-division quotient, the
+    register-indexed `LDC` at pc 0x9b8, the instance attributes, `a1.x`, the `cb9[53]` factor) keeps the hang. The
+    GLSL has no loops and the translation of every instruction on that path was checked.
+  - **Same build on the RTX 4060 (same driver 621.14) plays through the splash** (screenshots: Jabu-Jabu diving, then
+    the pool). So the identical SPIR-V and Vulkan calls hang only on the RTX 5060 - a Blackwell code-generation or
+    driver problem, not a wrong command from TriRod as far as these tests can tell.
+- **Added (diagnostics, kept):**
+  - `EOWRECOMP_VK_CHECKPOINTS=1` (`device.c`, `exec.c`): `VK_NV_device_diagnostic_checkpoints` marker before every
+    draw and dispatch (frame, draw, VS / FS, target size, mode, count, instances); after a device loss the log names
+    the last finished draw and the ones in flight. It found the draw when `EOWRECOMP_VK_DEVLOST_TRACE=2` (a submit
+    per pass) moved the hang.
+  - `EOWRECOMP_SKIP_FS=<hex>[,...]` (`exec.c`): skip draws whose VS or FS code address is listed.
+  - `EOWRECOMP_VK_TRACE_FS` now also logs the draw's index range and each vertex attribute (NVN format, stream,
+    offset, divisor, Vulkan format).
+  - `./setup/build.ps1` passes.
+- **Not done:** no fix and no test in `tools/` (nothing in the translator was found wrong). Next steps, in order:
+  try a newer NVIDIA driver on the RTX 5060; report the shader to NVIDIA (the GLSL of vs `72ea507300` is in
+  `<data>\build\glsl\` with `EOWRECOMP_SAVE_MSL=1`); look for an equivalent GLSL form of that VS that the driver
+  handles (each in-game test takes ~8 min: the scripted route below). Skipping the two draws on Blackwell would only
+  hide the splash particles.
+- Route used: `EOWRECOMP_INPUT=5000:A:12,5600:A:12,6300:A:12,6600:UP:12,6800:A:12,8000:STICK_UP:240` then `A` (8 frames)
+  every 90 frames from 8600; the device loss comes at frame ~13 800-14 400.
 
 ## RecompLauncher support (2026-11-26): file, packaging, windowless setup step and Play; not tried inside RecompLauncher, not committed
 

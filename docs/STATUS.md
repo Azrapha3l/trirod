@@ -1,6 +1,6 @@
 # Status
 
-Atualizado: 2026-11-27 (player reports: update NSP without its base now explained instead of "prod.keys: check failed"; Chinese text fixed (zh-Hans / zh-Hant codes, per-type shared fonts), tested in game; launcher wording. Before: RecompLauncher support: `recomplauncher.json`, launcher `--prepare` / `--play`, `trbuild --keys`; checked outside RecompLauncher only. Optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+Atualizado: 2026-11-27 (v0.4.3: RTX 5060 device loss in the Jabu-Jabu splash fixed - GLSL EXIT returns, tested in game. Before: player reports: update NSP without its base now explained instead of "prod.keys: check failed"; Chinese text fixed (zh-Hans / zh-Hant codes, per-type shared fonts), tested in game; launcher wording. Before: RecompLauncher support: `recomplauncher.json`, launcher `--prepare` / `--play`, `trbuild --keys`; checked outside RecompLauncher only. Optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
 
 ## Player reports (2026-11-27): update NSP / "prod.keys not valid", Chinese shown as Japanese, launcher clarity; tested, not committed
 
@@ -40,48 +40,47 @@ Atualizado: 2026-11-27 (player reports: update NSP without its base now explaine
 - **What the user should test:** Simplified and Traditional Chinese in the menu (F1 → language, then back to the title),
   Korean text, and the launcher with an update chosen and no base (the red reason, and Build Game off).
 
-## Jabu-Jabu splash device loss (2026-11-26): found, RTX 5060 (Blackwell) only; NOT fixed; diagnostics added, not committed
+## Jabu-Jabu splash device loss (2026-11-27): RTX 5060 driver miscompiled EXIT; fixed in the translator, tested in game (Vulkan), not committed
 
-Repro (user's report and the dev install): load the "Crossflows Plaza" save, go up one screen; in the cutscene, when
-Jabu-Jabu gets angry and splashes, the GPU hangs about 2 s and the device is lost (`[vk] device fault:` /
-`address ip invalid ...` / `FATAL: vkWaitSemaphores: -4`). The "needs a Vulkan 1.3 driver" text in the error box is
-the generic hint `platform/windows.c` adds to every Vulkan FATAL, not the cause.
+User report: open save 2 ("Crossflows Plaza"), go up one screen; in the cutscene, when Jabu-Jabu gets angry and splashes,
+the game froze and lost the device (`[vk] device fault: address ip invalid ...`, `FATAL: vkWaitSemaphores: -4`). The
+"needs a Vulkan 1.3 driver" text in the error box is the generic hint `platform/windows.c` adds to every Vulkan FATAL.
 
-- **Where (measured):** scripted runs in the dev install with scratch cache / save / settings (the save restored before
-  every run: the game autosaves, and a run that gets past the cutscene makes later runs start after it).
-  - With the new draw checkpoints the hang is always in the splash particle draws, on the frame after they first
-    appear: vs `72e9947a00` / fs `72ea504b00` finishes; vs `72ea504f00` / fs `72ea506e00` and vs `72ea507300` /
-    fs `72ea509100` are in flight. Skipping both (`EOWRECOMP_SKIP_FS=72ea504f00,72ea507300`) plays past the splash to
-    frame 17 200. Only vs `72ea507300` hangs by itself.
-  - It is the vertex stage: the hang stays when that VS writes an off-screen position (no fragments) and when its FS
-    writes a constant colour.
-  - Same hang with `EOWRECOMP_VK_GPL=0`, `EOWRECOMP_NO_FEEDBACK=1`, `EOWRECOMP_SHADER_GUARD=64`, optimized SPIR-V
-    (`EOWRECOMP_VK_OPT=1`), robustBufferAccess off, compute `72ebdf2e00` skipped, the BC4 / BC5-array textures
-    replaced by dummies, the RGB10A2 SNORM attribute read as R32, no compare sampler, NaN/Inf cleared from the output.
-    Validation layer: no messages.
-  - Bisect by outputs (temporary hooks, removed): it hangs exactly when varying `v2.z` (the sprite-atlas U, also used
-    by `v2.w`'s chain) is computed; cutting any single part of its computation (integer-division quotient, the
-    register-indexed `LDC` at pc 0x9b8, the instance attributes, `a1.x`, the `cb9[53]` factor) keeps the hang. The
-    GLSL has no loops and the translation of every instruction on that path was checked.
-  - **Same build on the RTX 4060 (same driver 621.14) plays through the splash** (screenshots: Jabu-Jabu diving, then
-    the pool). So the identical SPIR-V and Vulkan calls hang only on the RTX 5060 - a Blackwell code-generation or
-    driver problem, not a wrong command from TriRod as far as these tests can tell.
-- **Added (diagnostics, kept):**
-  - `EOWRECOMP_VK_CHECKPOINTS=1` (`device.c`, `exec.c`): `VK_NV_device_diagnostic_checkpoints` marker before every
-    draw and dispatch (frame, draw, VS / FS, target size, mode, count, instances); after a device loss the log names
-    the last finished draw and the ones in flight. It found the draw when `EOWRECOMP_VK_DEVLOST_TRACE=2` (a submit
-    per pass) moved the hang.
-  - `EOWRECOMP_SKIP_FS=<hex>[,...]` (`exec.c`): skip draws whose VS or FS code address is listed.
-  - `EOWRECOMP_VK_TRACE_FS` now also logs the draw's index range and each vertex attribute (NVN format, stream,
-    offset, divisor, Vulkan format).
-  - `./setup/build.ps1` passes.
-- **Not done:** no fix and no test in `tools/` (nothing in the translator was found wrong). Next steps, in order:
-  try a newer NVIDIA driver on the RTX 5060; report the shader to NVIDIA (the GLSL of vs `72ea507300` is in
-  `<data>\build\glsl\` with `EOWRECOMP_SAVE_MSL=1`); look for an equivalent GLSL form of that VS that the driver
-  handles (each in-game test takes ~8 min: the scripted route below). Skipping the two draws on Blackwell would only
-  hide the splash particles.
-- Route used: `EOWRECOMP_INPUT=5000:A:12,5600:A:12,6300:A:12,6600:UP:12,6800:A:12,8000:STICK_UP:240` then `A` (8 frames)
-  every 90 frames from 8600; the device loss comes at frame ~13 800-14 400.
+- **Cause (measured):** the NVIDIA driver on the RTX 5060 (Blackwell; 621.14 and 621.40) compiled the splash particles'
+  vertex shader `72ea507300` into an instruction the GPU rejects: the system log (nvlddmkm, event 13) says
+  `Graphics SM Warp Exception ... Illegal Instruction Encoding` for every run. The same build on the RTX 4060 (same
+  driver) plays through; the validation layer reports nothing.
+  - Found with: the new draw checkpoints (the draw in flight), then a standalone replay of the draw with its captured
+    inputs (VS GLSL, cbufs, vertex streams, indices from `EOWRECOMP_VK_TRACE_DUMP`) on the RTX 5060, which logs the
+    exception within seconds. Ruled out on the way: GPL, feedback snapshots, textures, samplers, vertex formats and
+    memory, robustBufferAccess, loop guards, SPIR-V optimization, `precise`, the dispatch-loop shader form.
+  - The trigger was the translator's EXIT in shaders with branches: `exit_now = true; break;` (a flag every later
+    block tests). Writing the same EXIT as the epilogue plus `return` removes the exception in the replay (repeated,
+    with every FS variant), and the shader then runs on both GPUs.
+- **Fix:** `runtime/nvn/maxwell/translate.c` (`glsl_finish`, new `glsl_epilogue`): GLSL EXIT in a shader with branches
+  is `{ <epilogue> return; }` (vertex: position flips / depth range; fragment: colour and depth outputs). MSL (Metal)
+  is unchanged. Every branched GLSL shader changes, so `PIPELINE_SCHEME` is 4 (`device.c`): older caches are not used
+  and Setup prepares shaders again.
+- **Tests:** `tools/test_exit_return.sh` (new, CPU, no game data: a VS and an FS with a predicated EXIT and a branch;
+  epilogue before every return, no flag EXIT, compiles): PASS; it fails against the previous translator (6 failures).
+  `REF=HEAD tools/test_translate.sh 20000 8 both`: MSL 0 differences, GLSL 0 compile / 0 validation failures (8 x 2500).
+  `tools/test_variant_fallback.sh`: 1822 checks passed. `tools/test_vk_pipelines.sh 2000 1` (RTX 4060, validation
+  layer): 0 failures, 0 messages (the test got a `vk_cache_dir` stub: it no longer linked since shaders.c uses it).
+- **In game (RTX 5060, Vulkan, GPL on, dev install, scratch cache / save / settings, empty cache):** the scripted route
+  below plays the whole scene: Jabu-Jabu's anger, the splash (`docs/screenshots/06_jabu_splash_rtx5060.jpg`), the dive,
+  the dialogue, back to Zelda at frame 18 600; no device fault and no nvlddmkm event during the run. `./setup/build.ps1`
+  passes. Not tested: Metal (unchanged), other scenes on the RTX 5060 beyond this route.
+- **Diagnostics added:** `EOWRECOMP_VK_CHECKPOINTS=1` (VK_NV_device_diagnostic_checkpoints: after a device loss the log
+  names the last finished draw and the ones in flight), `EOWRECOMP_SKIP_FS=<hex>[,...]` (skip draws by VS / FS
+  address), `EOWRECOMP_VK_TRACE_FS` also logs index range and vertex attributes, and `EOWRECOMP_VK_TRACE_DUMP=1` writes
+  the traced draw's VS inputs to `build/trace/` for replays.
+- **Notes for testing on Blackwell:** each GPU fault counts; after many in one session the RTX 5060 could not create a
+  Vulkan device any more (and once reported Code 43) until a reboot. The game autosaves into `EOWRECOMP_SAVE_DIR`:
+  restore the save copy before each scripted run.
+- Route: `EOWRECOMP_INPUT=5000:A:12,5600:A:12,6300:A:12,6600:UP:12,6800:A:12,8000:STICK_UP:240`, then `A` (8 frames) every
+  90 frames from 8600; the splash is at frame ~14 000.
+- **What the user should test:** on the RTX 5060, let Setup prepare shaders (the cache scheme changed), then play the
+  Jabu-Jabu scene and other areas; watch for any new freeze, and for stutter while shaders compile.
 
 ## RecompLauncher support (2026-11-26): file, packaging, windowless setup step and Play; not tried inside RecompLauncher, not committed
 

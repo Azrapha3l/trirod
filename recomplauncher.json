@@ -1,0 +1,138 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "TriRod",
+  "repo": "Azrapha3l/trirod",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your copy of The Legend of Zelda: Echoes of Wisdom, version 1.0.0 (title 01008CF01BAAC000): the .xci or .nsp, or a folder with its extracted exefs and romfs.",
+      "formats": [
+        { "type": "folder" },
+        { "type": "file", "extensions": ["xci", "nsp", "nca"], "requires": ["keys"] }
+      ]
+    },
+    {
+      "id": "update",
+      "label": "Optional: the game's version 1.1.0 update (.nsp). Without it the game builds as version 1.0.0.",
+      "role": "update",
+      "optional": true,
+      "formats": [{ "type": "file", "extensions": ["nsp"], "requires": ["keys"] }]
+    },
+    { "id": "keys", "label": "Your Nintendo Switch prod.keys", "role": "key", "shared": "switch.prod-keys" }
+  ],
+  "prepare": {
+    "program": ["Trirod-Launcher.exe"],
+    "args": ["--prepare", "--data", "{data}", "--game={input:game}", "--game-update={input:update}", "--keys={input:keys}"],
+    "label": "Building the game for PC from your copy (this takes a while)",
+    "done": ["{data}/trirod-install.json"],
+    "keeps_copy": true
+  },
+  "start": {
+    "program": ["Trirod-Launcher.exe"],
+    "args": ["--play", "--data", "{data}"]
+  },
+  "folders": {
+    "game": [{ "path": "{data}/extracted" }],
+    "saves": [{ "path": "{data}/save" }],
+    "logs": [{ "path": "{data}" }]
+  },
+  "saves": ["{data}/save"],
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{data}/eowrecomp.ini" }],
+      "new": { "aspect_asked": "0", "menu_tip_seen": "0" }
+    }
+  ],
+  "settings": [
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "help": "What the game draws at. 1x is the Switch's docked 1080p.",
+      "group": "Video",
+      "choices": [
+        { "label": "Match display", "set": { "resolution": "match" } },
+        { "label": "Dynamic", "set": { "resolution": "dynamic" } },
+        { "label": "1x (1080p)", "set": { "resolution": "1x" } },
+        { "label": "2x", "set": { "resolution": "2x" } },
+        { "label": "3x", "set": { "resolution": "3x" } },
+        { "label": "4x", "set": { "resolution": "4x" } }
+      ],
+      "defaults": { "resolution": "match" }
+    },
+    {
+      "id": "frame_rate",
+      "label": "Frame Rate",
+      "help": "30 FPS keeps the game's own pacing. The game makes at most 60 frames a second, so a higher cap doesn't speed it up.",
+      "group": "Video",
+      "choices": [
+        { "label": "30 FPS (Game)", "set": { "frame_rate": "game" } },
+        { "label": "60 FPS", "set": { "frame_rate": "60" } },
+        { "label": "120 FPS", "set": { "frame_rate": "120" } },
+        { "label": "Monitor refresh rate", "set": { "frame_rate": "monitor" } }
+      ],
+      "defaults": { "frame_rate": "game" }
+    },
+    {
+      "id": "fullscreen",
+      "label": "Full Screen",
+      "group": "Video",
+      "choices": [
+        { "label": "Off", "set": { "fullscreen": "0" } },
+        { "label": "On", "set": { "fullscreen": "1" } }
+      ],
+      "defaults": { "fullscreen": "0" }
+    },
+    {
+      "id": "aspect",
+      "label": "Aspect Ratio",
+      "help": "Unlocked fills the window with a wider or taller view; Original keeps 16:9 with bars.",
+      "group": "Video",
+      "choices": [
+        { "label": "Unlocked", "set": { "aspect": "unlocked" } },
+        { "label": "Original 16:9", "set": { "aspect": "original" } }
+      ],
+      "defaults": { "aspect": "unlocked" }
+    },
+    {
+      "id": "antialias",
+      "label": "Anti-Aliasing",
+      "group": "Video",
+      "choices": [
+        { "label": "Off", "set": { "antialias": "off" } },
+        { "label": "SMAA", "set": { "antialias": "smaa" } }
+      ],
+      "defaults": { "antialias": "off" }
+    },
+    {
+      "id": "upscaler",
+      "label": "Upscaling",
+      "help": "How a resolution below the window's is scaled up. FSR 1 is sharper.",
+      "group": "Video",
+      "choices": [
+        { "label": "AMD FSR 1", "set": { "upscaler": "fsr1" } },
+        { "label": "Bilinear", "set": { "upscaler": "bilinear" } }
+      ],
+      "defaults": { "upscaler": "fsr1" }
+    }
+  ],
+  "exit_codes": {
+    "0": "ok",
+    "20": "The game isn't built for this version of TriRod yet. Press Set Up Again on the game's page.",
+    "21": "Trirod.exe couldn't start. Press Set Up Again on the game's page to build it again.",
+    "22": "TriRod's own launcher window is open for this game. Close it, then press Play."
+  },
+  "actions": [
+    { "id": "open_saves", "label": "Open Save Folder", "open": "saves" },
+    { "id": "open_logs", "label": "Open Logs Folder", "help": "eowrecomp.log is the game's log; logs holds the build's.", "open": "logs" }
+  ],
+  "looks": {
+    "allowed": false,
+    "reason": "Play starts TriRod's launcher, which starts the game as a second program: looks don't reach it yet. The game has its own FSR 1 upscaling and SMAA."
+  },
+  "system": {
+    "windows": { "version": "10", "graphics": { "vulkan": "1.3" } }
+  }
+}

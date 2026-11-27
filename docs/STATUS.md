@@ -1,6 +1,65 @@
 # Status
 
-Atualizado: 2026-11-26 (optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+Atualizado: 2026-11-26 (RecompLauncher support: `recomplauncher.json`, launcher `--prepare` / `--play`, `trbuild --keys`; checked outside RecompLauncher only. Optional cheats: health and Hero Power tested in game; GPL black screen found and fixed in the scratch test; cache identity, ShaderPrep progress, in-game preparation after a GPU change; waiting for the user's in-game confirmation).
+
+## RecompLauncher support (2026-11-26): file, packaging, windowless setup step and Play; not tried inside RecompLauncher, not committed
+
+[RecompLauncher](https://github.com/elripalda/RecompLauncher) installs recomps from their GitHub releases and sets them
+up from `recomplauncher.json` at the top of the release zip. How each part maps onto the existing flow is in
+`docs/RELEASE-WORKFLOW.md`, "RecompLauncher".
+
+- **Added:**
+  - `recomplauncher.json` (repository root). Inputs: `game` (folder, or `.xci` / `.nsp` / `.nca` that require keys),
+    optional `update` (v1.1.0 `.nsp`), `keys` (shared `switch.prod-keys`). It also has `prepare`, `start`, `saves`,
+    `folders`, six video settings in `eowrecomp.ini`, `exit_codes`, two actions, looks turned off with a reason, and
+    `system` (Windows 10, Vulkan 1.3). There are no `check` and no `dumps`: RecompLauncher can't read a Switch package
+    without keys, and no verified CRC32 is known.
+  - `Trirod-Launcher.exe --prepare` / `--play` (`runtime/launcher/launcher_win.cpp`): the existing `workflow()` and
+    Play with no window. `--prepare` prints `progress` lines on stdout and the reason last. `--play` waits for
+    `Trirod.exe` and passes on its exit status.
+  - Under `RECOMPLAUNCHER=1` the launcher makes no GitHub update check, and the data folder defaults to
+    `RECOMPLAUNCHER_DATA`.
+  - `trbuild check|files --keys <prod.keys>`: the keys file can be anywhere (Recomp Standards' `--keys <path>`). Without
+    it, nothing changes.
+  - Packaging: `setup/pack_tools.ps1` stages the file and `setup/make_release.ps1` zips it at the top (and refuses a file
+    without `format: 1`, `start` and `prepare`). The README has the "Get it on RecompLauncher" badge (linking to
+    recomplauncher.com: the project isn't in RecompLauncher's catalog) and a short "With RecompLauncher" section.
+- **Checked (Windows, outside RecompLauncher; scratch data folders; packages read-only; a copy of the keys in the
+  scratchpad, deleted afterwards):**
+  - Schema: `recomplauncher.json` validates against RecompLauncher's `docs/recomplauncher.schema.json` (draft-07,
+    `jsonschema`: 0 errors).
+  - `./setup/build.ps1` passes. `setup/make_release.ps1` (local output, nothing uploaded) makes
+    `TriRod-v0.4.0-Windows-x64.zip` with `recomplauncher.json` at the top, byte-identical to the repository's. The
+    unpacked zip passes `setup/check_package.ps1`, and no game file is in it.
+  - Full setup step with RecompLauncher's arguments (`--game=<v1.0.0 nsp> --game-update=<v1.1.0 nsp> --keys=<copy
+    elsewhere>`, `RECOMPLAUNCHER=1`, `TEMP` in scratch). Exit 0 after 1400 s: the extraction used the `--keys` copy
+    (trbuild's log names it), 2155 files compiled, shaders prepared, and `trirod-install.json` was written. All 2186
+    stdout lines were `progress` lines, never decreasing, over the four stages.
+  - Run again with the same files: `progress 1 Already built` in 4 s. Without `--game` (the copy gone, `keeps_copy`):
+    `Already built` in 1 s. After deleting `trirod-install.json`, without `--game`: rebuilt from `extracted\` in 69 s
+    (0 files compiled).
+  - Failures print `Setup failed: <reason>` last and exit 1: an empty data folder, and a missing package.
+  - `--play`: exit 20 when not built. When built, `Trirod.exe` started from the data folder with the DLLs from the
+    install folder (`eowrecomp.log`: modules loaded, Vulkan swapchain, warm-up). The launcher stayed until the game was
+    ended and exited with the game's status (-1 from `Stop-Process`).
+  - Release-build launcher (with `UPDATE_REPO`) from the unpacked zip: 3 HTTPS connections at start alone, 0 with
+    `RECOMPLAUNCHER=1`, and then the data folder was `RECOMPLAUNCHER_DATA`. It starts normally without the new
+    arguments.
+  - `tools/test_self_update.ps1`: all checks passed on the second run. On the first run scenario 4 failed (the staged
+    launcher with a broken `SDL3.dll`: the old launcher's `--version` check got no answer within the test's 90 s, and
+    its log ends at the command). The same broken launcher run by hand exits at once (0xC000012F). The scenario looks
+    flaky; it is code these changes don't touch.
+  - Found in passing: `setup/check_package.ps1` gives a false refusal for a package path written with an 8.3 short
+    name (`AZRAPH~1`). `FullName` comes back long, so the relative paths come out wrong
+    (`p\tools\shader_catalog\warm\recipes.bin`). The long path passes. Not fixed here.
+- **Not tested (needs RecompLauncher or a published release):** RecompLauncher's own reading of the file (its Developer
+  tab "Add a build" is the check to run), its setup screen and shared-keys copy, `done` / `keeps_copy` as it applies
+  them, settings editing of `eowrecomp.ini`, save backups, exit-code messages, and install / update from a GitHub
+  release with the file. Big Picture behaviour (`RECOMPLAUNCHER_MODE`) is not used.
+- **What the user should test:** in RecompLauncher, Settings → Developers → Developer tools → "Add a build" on
+  `build\setup-dev` (or an unpacked release zip). Check that the Developer tab shows no red, then Set Up with the
+  `.nsp`s and keys, Play, and change a setting. Watch for whether its `prod.keys` copy has the keys the packages need,
+  and whether looks / ReShade should stay off.
 
 ## Optional cheats (2026-11-26): Infinite Rupees / Health / Hero Power; health and Hero Power tested in game (Vulkan, v1.1.0), not committed
 

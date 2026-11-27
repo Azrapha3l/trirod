@@ -14,11 +14,12 @@ publishing an update. The progress protocol between the launcher and its tools i
 | `Trirod.exe` | linked by `trbuild code` from `tools/link-kit/eowruntime.a` into the data folder | The game runtime. It is the only program that renders the game. |
 | `extracted/Trirod.dll` | built by `trbuild code` from the player's ExeFS | The game code, built from the player's own files. It is never distributed. |
 | `TriRod-<version>-Windows-x64.zip` + `trirod-release.json` | `setup/make_release.ps1` | The release assets. The manifest's `assets[].name` contains the exact ZIP filename. |
+| `recomplauncher.json` | repository root, copied to the package's top level by `setup/pack_tools.ps1` | What [RecompLauncher](https://github.com/elripalda/RecompLauncher) reads: setup inputs, the setup step, Play, settings, saves (below, "RecompLauncher"). |
 
 Install folder layout (`setup/pack_tools.ps1` stages it; a release zip unpacks to the same layout):
 
 ```
-Trirod-Launcher.exe  trbuild.exe  Trirod-ShaderPrep.exe  <runtime DLLs>  icon.png  trirod.ico
+Trirod-Launcher.exe  trbuild.exe  Trirod-ShaderPrep.exe  <runtime DLLs>  icon.png  trirod.ico  recomplauncher.json
 tools\  trirod-tools.json  trgen\  zig\  link-kit\  gamelib-src\  source\
        shader_catalog\warm\recipes.bin  shader_catalog\warm\code\
 ```
@@ -291,6 +292,60 @@ install folder) they sit beside it. With `--data <other folder>`, start the game
 which puts the install folder first on `PATH`. Double-clicking that `Trirod.exe` shows Windows' "DLL not found"
 error.
 
+## RecompLauncher (added 2026-11-26; not yet tried in RecompLauncher)
+
+[RecompLauncher](https://github.com/elripalda/RecompLauncher) installs a recomp from its GitHub releases and sets it up
+from one file, `recomplauncher.json`, at the top of the release zip. Its rules are in its `docs/ADD-SUPPORT.md` and
+`docs/DEVELOPERS.md`. The schema is `https://recomplauncher.com/schema/recomplauncher.json`. TriRod's file is
+`recomplauncher.json` in the repository root. `setup/pack_tools.ps1` copies it beside the launcher, and
+`setup/make_release.ps1` includes it in the zip (it checks for `format: 1`, `start` and `prepare`).
+
+How it maps onto the existing flow (no new program; the launcher's existing orchestration without its window):
+
+- **Inputs.** `game` takes a folder or a `.xci` / `.nsp` / `.nca`. `update` is the optional v1.1.0 `.nsp`. `keys` is
+  RecompLauncher's shared `switch.prod-keys`, asked for only when a package is picked (`requires`). RecompLauncher
+  can't check a Switch package without keys, so there is no `check`. `trbuild` identifies the files by content and the
+  setup step fails with its reason. There are no `dumps`: no verified size or CRC32 is known.
+- **Setup step (`prepare`).** It runs `Trirod-Launcher.exe --prepare --data {data} --game=<copy> --game-update=<update>
+  --keys=<prod.keys>`. This is `workflow()` without a window: `trbuild files` (with `--keys`, new in `trbuild`),
+  `trbuild code`, then `Trirod-ShaderPrep`.
+  - Progress goes to stdout as `progress <0..1> <stage: text>` lines, and the tools' output to stderr.
+  - On failure it prints `Setup failed: <reason>` last and exits 1.
+  - The chosen files are stored in `trirod-launcher.ini` (`source`, `update`, `keys`), so the launcher's own window
+    shows and rebuilds the same selection.
+  - It prints `progress 1 Already built` and exits 0 when the build state matches these tools and `trbuild check` says
+    the extraction is current for the selection. RecompLauncher runs the step after every release.
+  - `trirod-install.json` is the step's `done` file. It is deleted before a build and written only after a
+    successful one.
+  - `keeps_copy`: without `--game` (the player removed their copy), it rebuilds from `{data}\extracted`
+    (`folders.game`).
+- **Play (`start`).** `Trirod-Launcher.exe --play --data {data}` starts `Trirod.exe`, as **Play** does: the data folder
+  is the working directory and the install folder comes first on `PATH`. It waits for the game and exits with its
+  status. The launcher's own exit statuses: 20 (not built for these tools), 21 (`Trirod.exe` didn't start), 22 (the
+  launcher window is open for this data folder). `exit_codes` maps them to messages, and 0 is a normal quit.
+- **Data.** `{data}` (`<install>\recompdata`) is the data folder: `extracted\`, `Trirod.exe`, `save\` (`saves`),
+  `cache\` (left out of RecompLauncher's backups), `eowrecomp.ini` (`config`; six video settings in `settings`) and the
+  logs (`folders.logs` is `{data}`: `eowrecomp.log`, `logs\last-build.log`). When RecompLauncher sets
+  `RECOMPLAUNCHER=1` (also when the player skips its Easy Setup and gets the launcher window), the launcher makes no
+  GitHub update check. RecompLauncher installs the releases instead. The data folder then defaults to
+  `RECOMPLAUNCHER_DATA` when no `--data` is given.
+- **Release assets.** The zip name `TriRod-<version>-Windows-x64.zip` already names the system and processor, as
+  RecompLauncher requires. Tag releases `vMAJOR.MINOR.PATCH` (RecompLauncher's standard; `setup/deploy.ps1` also
+  accepts `alpha_N` / `beta_N`). `trirod-release.json` is a second asset of the same release; RecompLauncher's docs
+  don't say how it treats a JSON asset beside the zip.
+- **Looks** (ReShade) are turned off with a reason: Play's program is the launcher, which starts the game as a
+  second program.
+
+Checked locally (2026-11-26): the file validates against RecompLauncher's schema (draft-07, `jsonschema`). The package
+from `./setup/build.ps1` has it at the top and passes `setup/check_package.ps1`. `--prepare` / `--play` were run by hand
+with RecompLauncher's arguments in scratch data folders (results in `docs/STATUS.md`).
+
+**Not tested:** anything inside RecompLauncher itself: its setup screen and inputs, the shared-keys copy it passes,
+`keeps_copy`, `done`, settings editing, save backups, exit-code messages, and installing or updating from a published
+GitHub release. No release with `recomplauncher.json` has been published. The project isn't in RecompLauncher's
+catalog (the README badge links to recomplauncher.com); listing it is a submission at recomplauncher.com, an outward
+step for the maintainer.
+
 ## Local development builds (no upload)
 
 1. Edit the source in the checkout.
@@ -341,4 +396,5 @@ A fresh user downloads the same zip from the release page, unpacks it, and start
   `Trirod-Launcher.exe`, the new one is used from the next start.
 - No release has been published with this format, so the GitHub path (`check_release` / `apply_update`) has only been
   built, not run against a real release.
-- Linux and macOS keep the in-process start screen (`runtime/ui/launcher.mm`). This workflow is Windows-only.
+- Linux and macOS keep the in-process start screen (`runtime/ui/launcher.mm`). This workflow is Windows-only, and so is
+  `recomplauncher.json` (no Linux tarball / AppImage or macOS zip is released).

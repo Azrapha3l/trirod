@@ -41,11 +41,15 @@ which holds the runtime DLLs.
 | Visible stage | Command | Work |
 | --- | --- | --- |
 | Updating Trirod tools (only when updating) | done by the launcher: WinHTTP download, SHA-256 check, then `%SystemRoot%\System32\tar.exe -xf <zip> -C <stage>` | Download, verify, unpack, and swap the release's tools package |
-| Preparing game files | `trbuild.exe files --data <data> [--source <folder or .xci/.nsp>] [--update <.nsp>]` | Finds the player's files and identifies each package by content (base v1.0.0, update v1.1.0; title `01008CF01BAAC000`). Reuses `extracted/` only when its import record (`extracted/import.txt`: the chosen packages' and keys file's path, size and time, and main's build ID) matches the selection; an extraction from before records is reused when its main is the version the selection makes, and the record is written then. Otherwise it extracts ExeFS and the RomFS image (`nx_setup` / `nx_setup_update`, or copy and `romfs_build`) into `extracted/.import`, checks the main build ID, and only then swaps the new files in (the old ones, with their shader catalog, are removed after the swap; a failed import leaves them as they were). Then runs `trgen --shader-catalog`, which **only copies** BNSH control/code records into `extracted/shader_catalog`. |
+| Preparing game files | `trbuild.exe files --data <data> [--source <folder or .xci/.nsp>] [--update <.nsp>] [--keys <prod.keys>]` | Finds the player's files and identifies each package by content (base v1.0.0, update v1.1.0; title `01008CF01BAAC000`). Reuses `extracted/` only when its import record (`extracted/import.txt`: the chosen packages' and keys file's path, size and time, and main's build ID) matches the selection; an extraction from before records is reused when its main is the version the selection makes, and the record is written then. Otherwise it extracts ExeFS and the RomFS image (`nx_setup` / `nx_setup_update`, or copy and `romfs_build`) into `extracted/.import`, checks the main build ID, and only then swaps the new files in (the old ones, with their shader catalog, are removed after the swap; a failed import leaves them as they were). Then runs `trgen --shader-catalog`, which **only copies** BNSH control/code records into `extracted/shader_catalog`. |
 | Translating game code for PC | `trbuild.exe code --data <data>` | `trgen` lifts each ExeFS module to C. Compiles of finished files already run during this stage. |
 | Compiling and linking the generated code | same process (stage event `compile`) | `zig cc` for the remaining files, then links `extracted\Trirod.dll` and `<data>\Trirod.exe` |
 | Preparing shaders for the graphics device | `Trirod-ShaderPrep.exe --data <data>` | See `runtime/tools/shaderprep.c` and `docs/RELEASE-WORKFLOW.md`. A failure or skip does not fail the build. |
 
-`trbuild.exe check --data <data> [--source <path>] [--update <.nsp>]` validates a chosen source before **Recompile** is
-offered and reports what it found and whether the existing extraction is current for it (`@@extracted`). It reads only
+`trbuild.exe check --data <data> [--source <path>] [--update <.nsp>] [--keys <prod.keys>]` validates a chosen source before
+**Recompile** is offered and reports what it found and whether the existing extraction is current for it (`@@extracted`). It reads only
 the packages' headers and ExeFS directory; nothing is written.
+
+`--keys` names the player's `prod.keys` wherever it is (RecompLauncher passes its own copy of the shared key file;
+the launcher stores it as `keys=` in `trirod-launcher.ini`). Without it, packages need `prod.keys` beside them, or in the
+chosen folder. `title.keys` is looked for beside whichever `prod.keys` is used.

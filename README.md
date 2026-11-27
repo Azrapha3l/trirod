@@ -2,6 +2,8 @@
 
 **A Windows launcher and static recompilation project for _The Legend of Zelda: Echoes of Wisdom_.**
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 Trirod is a continuation of [EoWRecomp](https://github.com/Nycolazs/EoWRecomp) and its contributors' work. This repository carries that project forward and develops the Trirod launcher, Windows build and update workflow, and external shader preparation tools.
 
 > [!WARNING]
@@ -34,6 +36,10 @@ The first build can take a while. The generated game code and device-specific sh
 On later launches, run `Trirod-Launcher.exe` again and choose **Play**. Release builds check GitHub for a newer Trirod tools package. The online update path is newly implemented and is still being tested; see [docs/RELEASE-WORKFLOW.md](docs/RELEASE-WORKFLOW.md) for its behavior and current verification status.
 
 By default, game files, saves, settings, and caches are stored alongside the launcher. To keep them elsewhere, start the launcher with `--data <folder>`.
+
+### With RecompLauncher
+
+Releases include a `recomplauncher.json` for [RecompLauncher](https://github.com/elripalda/RecompLauncher). There, you pick your game copy, the optional 1.1.0 update and your `prod.keys` on its setup screen. RecompLauncher runs the same build without a window, and **Play** starts the game. Saves, settings, and caches stay in the game's `recompdata` folder. RecompLauncher installs updates itself, so the launcher's own update check is off. This has not been tried in RecompLauncher yet: see [docs/RELEASE-WORKFLOW.md](docs/RELEASE-WORKFLOW.md).
 
 ## Building from source
 

@@ -148,6 +148,9 @@ Get-ChildItem -LiteralPath (Join-Path $root 'build\win\deps\ffmpeg\bin') -Filter
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'assets\trirod.ico') -Destination (Join-Path $out 'trirod.ico') -Force
 Copy-Item -LiteralPath (Join-Path $root 'docs\icon\icon_1024.png') -Destination (Join-Path $out 'icon.png') -Force
 Copy-Item -LiteralPath (Join-Path $root 'runtime\launcher\assets\launcher-skin.png') -Destination (Join-Path $out 'launcher-skin.png') -Force
+# RecompLauncher reads its setup, Play and settings description from the top of the release, beside the launcher
+# (docs/RELEASE-WORKFLOW.md, "RecompLauncher")
+Copy-Item -LiteralPath (Join-Path $root 'recomplauncher.json') -Destination (Join-Path $out 'recomplauncher.json') -Force
 # Files of the old Setup that the new launcher no longer uses
 foreach ($old in @('Tools.zip', 'eowsetup.exe', 'eowgame.dll', 'eowgame.dll.id')) {
     Remove-Item -LiteralPath (Join-Path $out $old) -Force -ErrorAction SilentlyContinue

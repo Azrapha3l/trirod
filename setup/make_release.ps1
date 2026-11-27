@@ -16,7 +16,8 @@ param(
 )
 
 # Produces the two files a Windows release carries (docs/RELEASE-WORKFLOW.md, "Maintainer release procedure"):
-#   TriRod-<version>-Windows-x64.zip   the installation (launcher, trbuild, Trirod-ShaderPrep, runtime DLLs, tools/)
+#   TriRod-<version>-Windows-x64.zip   the installation (launcher, trbuild, Trirod-ShaderPrep, runtime DLLs, tools/,
+#                                      recomplauncher.json at the top for RecompLauncher)
 #   trirod-release.json          what the launcher reads: version, build identifiers, the zip's size and SHA-256
 # Nothing is uploaded: attach both files to one GitHub Release yourself. Game files and anything made from them are
 # refused (setup/check_package.ps1), and the player's data in a development installation is left out.
@@ -42,7 +43,8 @@ if (Test-Path -LiteralPath $outVersion) { Remove-Item -LiteralPath $outVersion -
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 # Only the installation's own files (an allowlist), never the data a development run left beside them
-$top = @('Trirod-Launcher.exe', 'trbuild.exe', 'Trirod-ShaderPrep.exe', 'trirod.ico', 'icon.png', 'launcher-skin.png', 'tools')
+$top = @('Trirod-Launcher.exe', 'trbuild.exe', 'Trirod-ShaderPrep.exe', 'trirod.ico', 'icon.png', 'launcher-skin.png',
+         'recomplauncher.json', 'tools')
 foreach ($name in $top) {
     $from = Join-Path $pkg $name
     if (-not (Test-Path -LiteralPath $from)) { throw "The package has no $name." }
@@ -50,6 +52,9 @@ foreach ($name in $top) {
 }
 Get-ChildItem -LiteralPath $pkg -Filter '*.dll' -File | Where-Object { $_.Name -notin @('Trirod.dll', 'eowgame.dll') } |
     Copy-Item -Destination $stage
+# (RecompLauncher skips a recomplauncher.json it can't read, whole: at least the JSON and its format must be right)
+$rl = Get-Content -LiteralPath (Join-Path $stage 'recomplauncher.json') -Raw | ConvertFrom-Json
+if ($rl.format -ne 1 -or -not $rl.start -or -not $rl.prepare) { throw "recomplauncher.json has no format 1, start or prepare." }
 & (Join-Path $PSScriptRoot 'check_package.ps1') -PackageDir $stage
 
 # zip with Windows' own tar (bsdtar): forward-slash entry names, and the launcher unpacks with the same tool

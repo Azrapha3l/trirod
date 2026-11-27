@@ -18,6 +18,15 @@
 //     --console (or EOWRECOMP_CONSOLE=1): a diagnostic console. The launcher is a GUI program and opens none by
 //            default; with this it prints its build log there (the console it was started from, or a new one) and
 //            starts Trirod.exe with --console, which prints the game's detailed diagnostics to the same console.
+//
+//   Trirod-Launcher.exe --prepare --data <folder> [--game=<source>] [--game-update=<.nsp>] [--keys=<prod.keys>]
+//   Trirod-Launcher.exe --play --data <folder>
+//     RecompLauncher's setup step and Play (recomplauncher.json, docs/RELEASE-WORKFLOW.md "RecompLauncher"), with no
+//     window. --prepare runs the same build as Recompile and prints "progress <0..1> <text>" lines on stdout, the
+//     tools' output on stderr, and the reason last when it fails (exit 1). --play starts the built Trirod.exe, waits
+//     for it and exits with its status (PLAY_* below when it can't). Under RecompLauncher (RECOMPLAUNCHER=1) the
+//     launcher never checks GitHub for updates (RecompLauncher installs the releases), and the data folder defaults
+//     to RECOMPLAUNCHER_DATA.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -312,6 +321,7 @@ struct Paths {
 static Paths g_paths;
 static bool g_dev;
 static bool g_console;  // --console / EOWRECOMP_CONSOLE=1
+static bool g_headless;  // --prepare: no window; the build log goes to stderr, progress lines to stdout
 
 // tools/trirod-tools.json (setup/pack_tools.ps1): which release the tools are and the build identifiers they produce
 struct ToolsInfo {
@@ -399,12 +409,51 @@ static void log_line(int kind, const std::string &t) {
         fprintf(g_log_file, "%s%s\n", tag[kind], t.c_str());
         fflush(g_log_file);
     }
-    if (g_console) fprintf(stderr, "%s\n", t.c_str());
+    if (g_console && !g_headless) fprintf(stderr, "%s\n", t.c_str());
+    else if (g_headless) {  // (a GUI program: the inherited handle, not the CRT's stderr)
+        std::string l = t + "\n";
+        DWORD n;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), l.data(), (DWORD)l.size(), &n, NULL);
+    }
 }
 static void set_status(const std::string &s) { std::lock_guard<std::mutex> l(g_mu); g_status = s; }
 static Step *step(const std::string &id) {
     for (auto &s : g_steps) if (s.id == id) return &s;
     return NULL;
+}
+
+// --prepare: one line on stdout (RecompLauncher's setup step reads "progress <0..1> <text>")
+static void stdout_line(const std::string &t) {
+    std::string l = t + "\n";
+    DWORD n;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), l.data(), (DWORD)l.size(), &n, NULL);
+}
+// The whole build as one fraction (g_mu held). The weights only shape the bar: the stages take very different times
+// on different PCs, and the code stages are quick when the generated objects are reused.
+static void report_progress(bool force) {
+    if (!g_headless) return;
+    static const struct { const char *id; double weight; } WEIGHT[] = {
+        {"files", 0.25}, {"translate", 0.2}, {"compile", 0.35}, {"shaders", 0.2}};
+    double f = 0;
+    const Step *cur = NULL;
+    for (auto &w : WEIGHT) {
+        const Step *s = step(w.id);
+        if (!s) continue;
+        f += w.weight * (s->state == StepState::Pending ? 0 : s->state == StepState::Running ? s->progress : 1);
+        if (s->state == StepState::Running) cur = s;
+    }
+    static ULONGLONG last;
+    static std::string last_title;
+    ULONGLONG now = GetTickCount64();
+    // (trbuild reports every few megabytes: four lines a second are plenty, but every new stage is shown)
+    if (!force && now - last < 250 && cur && cur->title == last_title) return;
+    last = now;
+    last_title = cur ? cur->title : "";
+    char num[16];
+    snprintf(num, sizeof num, "%.3f", f > 1 ? 1.0 : f);
+    stdout_line(std::string("progress ") + num + " " +
+                (!cur ? std::string("Building the game")
+                      : cur->text.empty() || cur->text == cur->title ? cur->title : cur->title + ": " + cur->text));
 }
 
 // ================================================================== running a tool
@@ -449,6 +498,7 @@ static void handle_event(const std::string &line, ToolResult &r) {
     else if (kind == "extracted") r.extracted = rest;
     else if (kind == "version") r.version = rest;  // (Trirod-Launcher.exe --version: the self-update's check)
     else if (kind == "done") r.done = true;
+    if (kind == "stage" || kind == "progress") report_progress(kind == "stage");
 }
 
 static void reader(HANDLE h, bool events, ToolResult *r) {
@@ -1204,6 +1254,7 @@ static void workflow(bool update_first, Release rel) {
     std::vector<std::string> files = {g_paths.trbuild(), "files", "--data", g_paths.data};
     if (!source.empty()) files.insert(files.end(), {"--source", source});
     if (!source.empty() && !update.empty()) files.insert(files.end(), {"--update", update});
+    if (!source.empty() && file_exists(g_config["keys"])) files.insert(files.end(), {"--keys", g_config["keys"]});
     Run runs[] = {
         {"trbuild files", files},
         {"trbuild code", {g_paths.trbuild(), "code", "--data", g_paths.data}},
@@ -1250,6 +1301,7 @@ static void validate(std::string source, std::string update) {
     std::vector<std::string> argv = {g_paths.trbuild(), "check", "--data", g_paths.data};
     if (!source.empty()) argv.insert(argv.end(), {"--source", source});
     if (!source.empty() && !update.empty()) argv.insert(argv.end(), {"--update", update});
+    if (!source.empty() && file_exists(g_config["keys"])) argv.insert(argv.end(), {"--keys", g_config["keys"]});
     ToolResult r = run_tool("trbuild check", argv, g_paths.data);
     std::lock_guard<std::mutex> l(g_mu);
     g_valid.running = false;
@@ -1332,6 +1384,83 @@ static bool play(std::string &why) {
 }
 
 static void open_folder(const std::string &p) { ShellExecuteW(NULL, L"open", widen(p).c_str(), NULL, NULL, SW_SHOWNORMAL); }
+
+// ================================================================== RecompLauncher (no window)
+static bool single_instance(DWORD wait_ms);
+// recomplauncher.json names these exit statuses for the player; Trirod.exe's own statuses pass through --play.
+enum { PLAY_NOT_BUILT = 20, PLAY_NO_START = 21, PLAY_BUSY = 22 };
+
+// --prepare: RecompLauncher's setup step. The same build as Recompile (workflow), from the files RecompLauncher
+// passes, which are also stored in trirod-launcher.ini so this launcher's own window shows the same choice. Without
+// --game (the player's copy is gone: recomplauncher.json keeps_copy) it builds from what extracted\ already holds.
+static int prepare_mode(const std::string &source, const std::string &update, const std::string &keys) {
+    g_headless = true;
+    auto fail = [](const std::string &why) {
+        stdout_line("Setup failed: " + why);  // (printed last: RecompLauncher shows the player the last lines)
+        return 1;
+    };
+    if (!single_instance(0)) return fail("Trirod Launcher is open for this game: close it, then set up again");
+    ToolsInfo tools = read_tools();
+    if (!tools.present) return fail("the build tools are missing (" + tools.why + "): reinstall the game");
+    if (!source.empty()) {
+        g_config["source"] = source;
+        g_config["update"] = update;
+        if (!keys.empty()) g_config["keys"] = keys; else g_config.erase("keys");
+    } else g_config.erase("source"), g_config.erase("update");  // (no copy given: it is gone, so extracted\ is the source)
+    config_save();
+    reset_steps(false);
+    open_build_log();
+    if (g_config["source"].empty() && !file_exists(g_paths.extracted() + "\\exefs\\main"))
+        return fail("no copy of the game was given, and no game files from an earlier setup are kept: pick your copy");
+    // Built by these tools from the same files: nothing to do (RecompLauncher runs this step after every release)
+    if (build_state(tools).empty() && file_exists(g_paths.install_json())) {
+        validate(g_config["source"], g_config["update"]);
+        bool same = g_config["source"].empty() ? g_valid.ok : g_valid.ok && g_valid.extracted == "current";
+        if (same) {
+            log_line(3, "already built for these tools from " + (g_config["source"].empty() ? g_paths.extracted() : g_config["source"]));
+            stdout_line("progress 1 Already built");
+            return 0;
+        }
+    }
+    // (trirod-install.json is the step's "done" file: gone while building, so a build cut short never looks finished)
+    DeleteFileW(widen(g_paths.install_json()).c_str());
+    g_busy = true;
+    workflow(false, Release());
+    std::string error;
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        error = g_error;
+    }
+    if (!error.empty() || !file_exists(g_paths.install_json())) {
+        stdout_line("Full log: " + g_paths.logs() + "\\last-build.log");
+        return fail(error.empty() ? "the build did not finish" : error);
+    }
+    stdout_line("progress 1 Ready to play");
+    return 0;
+}
+
+// --play: RecompLauncher's Play. Starts the built game as the window's Play does, and stays until it closes, so
+// RecompLauncher sees the session end (it backs up the saves then) and the game's exit status.
+static int play_mode() {
+    if (!single_instance(0)) return PLAY_BUSY;
+    std::string state = build_state(read_tools());
+    if (!state.empty()) return PLAY_NOT_BUILT;
+    std::wstring exe = widen(g_paths.game_exe());
+    std::wstring cmd = L"\"" + exe + L"\"" + (g_console ? L" --console" : L"");
+    std::wstring env = child_env();
+    STARTUPINFOW si = {};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, env.data(),
+                        widen(g_paths.data).c_str(), &si, &pi))
+        return PLAY_NO_START;
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+}
 
 // ================================================================== the window
 static void style() {
@@ -1648,13 +1777,25 @@ int main(int argc, char **argv) {
     bool auto_update = false;     // --update: start the update as soon as the check finds a newer release (tests)
     std::string apply_dir, updated, update_error, update_from;
     DWORD wait_pid = 0;
+    bool prepare = false, play_only = false, data_given = false;  // --prepare / --play: RecompLauncher's, no window
+    std::string game, game_update, keys;
+    // "--name=value" or "--name value" (RecompLauncher passes optional files as one argument, flag and path together)
+    auto value = [&](int &i, const char *name, std::string &out) {
+        size_t n = strlen(name);
+        if (!strncmp(argv[i], name, n) && argv[i][n] == '=') return out = argv[i] + n + 1, true;
+        if (!strcmp(argv[i], name) && i + 1 < argc) return out = argv[++i], true;
+        return false;
+    };
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--dev")) g_dev = true;
+        if (!strcmp(argv[i], "--prepare")) prepare = true;
+        else if (!strcmp(argv[i], "--play")) play_only = true;
+        else if (value(i, "--game", game) || value(i, "--game-update", game_update) || value(i, "--keys", keys)) {}
+        else if (!strcmp(argv[i], "--dev")) g_dev = true;
         else if (!strcmp(argv[i], "--recompile")) auto_recompile = true;
         else if (!strcmp(argv[i], "--prepare-shaders")) auto_shaders = true;
         else if (!strcmp(argv[i], "--console")) g_console = true;
         else if (!strcmp(argv[i], "--update")) auto_update = true;
-        else if (!strcmp(argv[i], "--data") && i + 1 < argc) g_paths.data = full_path(argv[++i]);
+        else if (!strcmp(argv[i], "--data") && i + 1 < argc) g_paths.data = full_path(argv[++i]), data_given = true;
         else if (!strcmp(argv[i], "--update-from") && i + 1 < argc) update_from = full_path(argv[++i]);
         // the self-update (stage_update / apply_mode): internal arguments
         else if (!strcmp(argv[i], "--apply-update") && i + 1 < argc) apply_dir = argv[++i];
@@ -1669,6 +1810,20 @@ int main(int argc, char **argv) {
         }
     }
     if (!apply_dir.empty()) return apply_mode(apply_dir, wait_pid);
+    // Started by RecompLauncher: it installs every release itself, so never two updaters on one folder, and the data
+    // folder is its {data} (RECOMPLAUNCHER_DATA) also when the player skips its Easy Setup and gets this window
+    const char *rl = getenv("RECOMPLAUNCHER"), *rl_data = getenv("RECOMPLAUNCHER_DATA");
+    bool recomplauncher = rl && !strcmp(rl, "1");
+    if (recomplauncher && !data_given && rl_data && *rl_data) g_paths.data = full_path(rl_data);
+    if (prepare || play_only) {
+        const char *e = getenv("EOWRECOMP_CONSOLE");
+        if (e && *e && strcmp(e, "0")) g_console = true;  // (only passed on to Trirod.exe: stderr is RecompLauncher's)
+        CreateDirectoryW(widen(g_paths.data).c_str(), NULL);
+        config_load();
+        if (prepare) return prepare_mode(game.empty() ? "" : full_path(game), game_update.empty() ? "" : full_path(game_update),
+                                         keys.empty() ? "" : full_path(keys));
+        return play_mode();
+    }
     if (!single_instance(updated.empty() && update_error.empty() ? 0 : 15000)) {
         MessageBoxW(NULL, widen("Trirod Launcher is already running for " + g_paths.data + ".").c_str(), L"Trirod Launcher",
                     MB_ICONINFORMATION);
@@ -1758,7 +1913,7 @@ int main(int argc, char **argv) {
     Uint64 tools_read_at = SDL_GetTicks();
     if (tools.present && (!g_config["source"].empty() || file_exists(g_paths.extracted() + "\\exefs\\main")))
         start_validation(g_config["source"], g_config["update"]);
-    if (!g_dev || !update_from.empty()) {  // (--update-from: a release on disk, also in development mode)
+    if ((!g_dev && !recomplauncher) || !update_from.empty()) {  // (--update-from: a release on disk, also in development mode)
         g_checking = true;
         std::thread([tools, update_from] {
             Release r = update_from.empty() ? check_release(tools) : check_release_local(update_from, tools);
@@ -1826,7 +1981,7 @@ int main(int argc, char **argv) {
             if (was_busy && !busy) start_validation(g_config["source"], g_config["update"]);
             was_busy = busy;
         }
-        bool need_update = (!g_dev || !update_from.empty()) && rel.ok && rel.newer;
+        bool need_update = ((!g_dev && !recomplauncher) || !update_from.empty()) && rel.ok && rel.newer;
         if (auto_update && !busy && !g_checking && rel.checked) {  // (--update: once, whatever the check found)
             auto_update = false;
             if (need_update) start_workflow(true);

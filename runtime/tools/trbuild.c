@@ -4,8 +4,9 @@
 // (runtime/gamebuild.c: trgen + zig cc into Trirod.dll and the runtime-only Trirod.exe). Progress goes out as the
 // protocol of runtime/tools/protocol.h (docs/TOOL-PROTOCOL.md); diagnostics go to stderr.
 //
-//   trbuild check --source <folder | .xci/.nsp/.nca> [--update <.nsp>] [--data <root>]
-//   trbuild files --source <...> [--update <.nsp>] [--data <root>] [--force]    stage "files": Preparing game files
+//   trbuild check --source <folder | .xci/.nsp/.nca> [--update <.nsp>] [--keys <prod.keys>] [--data <root>]
+//   trbuild files --source <...> [--update <.nsp>] [--keys <prod.keys>] [--data <root>] [--force]
+//                                                             stage "files": Preparing game files
 //   trbuild code  [--data <root>] [--jobs <n>]                stages "translate" and "compile"
 //   trbuild --version
 //
@@ -196,10 +197,13 @@ static void keys_beside(Found *g, const char *file) {
 }
 
 // The source as given: a folder (searched), or a package file itself (its prod.keys beside it); plus the update the
-// player chose separately, if any
+// player chose separately, if any. --keys names the player's keys file wherever it is (RecompLauncher passes its own
+// copy of the shared switch.prod-keys); then no prod.keys beside the packages is looked for.
+static const char *g_keys_arg;
 static void locate(const char *source, const char *update, Found *g) {
     memset(g, 0, sizeof *g);
     g->base_ver = g->update_ver = -1;
+    if (g_keys_arg && *g_keys_arg) snprintf(g->keys, sizeof g->keys, "%s", g_keys_arg);
     if (is_dir(source)) find_game(source, 0, g);
     else if (exists(source)) {
         add_package(g, source);
@@ -295,6 +299,7 @@ static const char *judge(Found *g, char *desc, size_t n) {
     }
     if (g->npkg) {
         if (!g->keys[0]) return "no prod.keys beside the game package: put the keys file from your own Switch next to it";
+        if (g_keys_arg && *g_keys_arg && !exists(g_keys_arg)) return "the keys file given with --keys is missing";
         static char why[700];
         if (!classify(g, why, sizeof why)) return why;
         if (g->update[0])
@@ -612,7 +617,7 @@ static int cmd_code(int jobs) {
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: trbuild check|files|code [--source <path>] [--update <.nsp>] [--data <root>] [--jobs <n>] [--force]\n"
+    fprintf(stderr, "usage: trbuild check|files|code [--source <path>] [--update <.nsp>] [--keys <prod.keys>] [--data <root>] [--jobs <n>] [--force]\n"
                     "       trbuild --version\n");
     return 2;
 }
@@ -631,6 +636,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--source") && i + 1 < argc) source = argv[++i];
         else if (!strcmp(argv[i], "--update") && i + 1 < argc) update = argv[++i];
+        else if (!strcmp(argv[i], "--keys") && i + 1 < argc) g_keys_arg = argv[++i];
         else if (!strcmp(argv[i], "--data") && i + 1 < argc) data = argv[++i];
         else if (!strcmp(argv[i], "--jobs") && i + 1 < argc) jobs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--force")) force = true;
@@ -646,6 +652,8 @@ int main(int argc, char **argv) {
     if (source && *source && _fullpath(src_abs, source, sizeof src_abs)) source = src_abs;
     static char update_abs[1100];
     if (update && *update && _fullpath(update_abs, update, sizeof update_abs)) update = update_abs;
+    static char keys_abs[1100];
+    if (g_keys_arg && *g_keys_arg && _fullpath(keys_abs, g_keys_arg, sizeof keys_abs)) g_keys_arg = keys_abs;
     tp_event("protocol %d trbuild %s", TOOL_PROTOCOL, TRIROD_VERSION);
     rt_paths_init();
     if (strcmp(cmd, "check") && !gamebuild_available()) {

@@ -3,6 +3,7 @@
 **A Windows launcher and static recompilation project for _The Legend of Zelda: Echoes of Wisdom_.**
 
 <a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+[![Verified developer on RecompStore](https://recompstore.com/assets/press/verified-dark.svg)](https://recompstore.com/dev/azrapha3l)
 
 Trirod is a continuation of [EoWRecomp](https://github.com/Nycolazs/EoWRecomp) and its contributors' work. This repository carries that project forward and develops the Trirod launcher, Windows build and update workflow, and external shader preparation tools.
 

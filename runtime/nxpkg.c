@@ -829,17 +829,44 @@ NxRomfs *nx_romfs_open(const char *src_path, char *why, size_t why_size) {
 }
 
 // ------------------------------------------------------------------ setup
+#define PERSONALIZED_TICKET                                                                                       \
+    "the package's ticket is personalized (tied to the console it was bought on), so prod.keys can't decrypt it: " \
+    "dump it again with your dump tool's option to remove console-specific data (a common ticket)"
+
+// The ticket's data after its signature block (Switchbrew "Ticket": signature type u32, signature, padding to 0x40):
+// 0 = a signature type this doesn't know.
+static size_t ticket_data_offset(uint32_t sig_type) {
+    switch (sig_type) {
+    case 0x10000: case 0x10003: return 4 + 0x200 + 0x3C;  // RSA-4096
+    case 0x10001: case 0x10004: return 4 + 0x100 + 0x3C;  // RSA-2048 (what eShop tickets use: data at 0x140)
+    case 0x10002: case 0x10005: return 4 + 0x3C + 0x40;   // ECDSA
+    default: return 0;
+    }
+}
+
+// The section key from the ticket (or title.keys). *personalized: the NSP's ticket for this rights ID is a
+// personalized one (title key type 1): its key block is RSA-OAEP encrypted for the console that bought the game, not
+// AES with titlekek, so it can't be read with prod.keys alone; taking its first 16 bytes gave a wrong key that showed
+// up as "ExeFS doesn't decrypt (wrong keys?)".
 static bool title_key(const Nca *nca, int fd, const Entries *files, const Keys *ks, const char *keys_path, int keygen,
-                      uint8_t out[16]) {
+                      uint8_t out[16], bool *personalized) {
     const uint8_t *rights = nca->hdr + 0x230;
     uint8_t enc[16];
     bool found = false;
-    for (int i = 0; i < files->n && !found; i++) {  // the NSP's ticket: <rights id>.tik, title key block at 0x180
+    *personalized = false;
+    for (int i = 0; i < files->n && !found; i++) {  // the NSP's ticket: <rights id>.tik
         size_t l = strlen(files->e[i].name);
-        if (l < 4 || strcmp(files->e[i].name + l - 4, ".tik") || files->e[i].size < 0x2B0) continue;
-        uint8_t tik[0x2B0];
-        if (pread_all(fd, tik, sizeof tik, files->e[i].off) && !memcmp(tik + 0x2A0, rights, 16))
-            memcpy(enc, tik + 0x180, 16), found = true;
+        if (l < 4 || strcmp(files->e[i].name + l - 4, ".tik")) continue;
+        uint8_t tik[0x400];
+        uint32_t sig;
+        if (files->e[i].size < 4 || !pread_all(fd, &sig, 4, files->e[i].off)) continue;
+        size_t d = ticket_data_offset(sig);
+        // (data: title key block +0x40, title key type +0x141, rights ID +0x160; 0x180 bytes in all)
+        if (!d || files->e[i].size < d + 0x180 || !pread_all(fd, tik, d + 0x180, files->e[i].off) ||
+            memcmp(tik + d + 0x160, rights, 16))
+            continue;
+        if (tik[d + 0x141] != 0) { *personalized = true; continue; }  // (title.keys may still have it)
+        memcpy(enc, tik + d + 0x40, 16), found = true;
     }
     if (!found) {  // title.keys beside prod.keys: <rights id> = <encrypted title key>
         char tk[1200], name[33];
@@ -855,6 +882,7 @@ static bool title_key(const Nca *nca, int fd, const Entries *files, const Keys *
         free(t.k);
     }
     if (!found) return false;
+    *personalized = false;
     char kn[32];
     snprintf(kn, sizeof kn, "titlekek_%02x", keygen);
     const uint8_t *kek = key_get(ks, kn, 16);
@@ -922,8 +950,9 @@ static bool program_open(const char *package, const char *keys_path, const Keys 
     int gen = p->nca.hdr[0x206] > p->nca.hdr[0x220] ? p->nca.hdr[0x206] : p->nca.hdr[0x220];
     int keygen = gen ? gen - 1 : 0;
     if (memcmp(p->nca.hdr + 0x230, (const uint8_t[16]){0}, 16)) {
-        if (!title_key(&p->nca, p->fd, &p->files, ks, keys_path, keygen, p->nca.ctr_key))
-            return WHY("package needs a title key not present in its ticket or title.keys");
+        bool personalized;
+        if (!title_key(&p->nca, p->fd, &p->files, ks, keys_path, keygen, p->nca.ctr_key, &personalized))
+            return WHY(personalized ? PERSONALIZED_TICKET : "package needs a title key not present in its ticket or title.keys");
     } else {
         char kn[48];
         snprintf(kn, sizeof kn, "key_area_key_application_%02x", keygen);
@@ -1266,8 +1295,9 @@ bool nx_setup(const char *package, const char *keys_path, const char *out_dir, u
     int keygen = gen ? gen - 1 : 0;
     static const uint8_t zero[16];
     if (memcmp(nca.hdr + 0x230, zero, 16)) {
-        if (!title_key(&nca, fd, &files, &ks, keys_path, keygen, nca.ctr_key)) {
-            WHY("the package needs a title key (no ticket in it, none in title.keys)");
+        bool personalized;
+        if (!title_key(&nca, fd, &files, &ks, keys_path, keygen, nca.ctr_key, &personalized)) {
+            WHY(personalized ? PERSONALIZED_TICKET : "the package needs a title key (no ticket in it, none in title.keys)");
             goto out;
         }
     } else {

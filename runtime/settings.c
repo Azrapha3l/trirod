@@ -29,9 +29,11 @@ Settings g_settings = {
 // The game's own text languages: its RomFS carries these per region (regionUS/USen|USes|USfr|USpt,
 // regionEU/EUen|EUde|EUes|EUfr|EUit|EUnl|EUru, regionJP/JPja, regionKR/KRko, regionTW/TWzh, regionCN/CNzh), and the
 // game picks one from the system language it reads back (runtime/services/am.c), as on the console. Codes as the
-// Switch reports them (nn::settings::LanguageCode).
+// Switch reports them (nn::settings::LanguageCode). Chinese is "zh-Hans" / "zh-Hant": the SDK's code -> application
+// language table (sdk f_700c387140) knows only those two, so the older "zh-CN" / "zh-TW" matched nothing and the
+// game fell back to Japanese text (a player's report: both Chinese choices showed Japanese).
 const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es",
-                                                   "es-419", "nl", "ru", "ko", "zh-CN", "zh-TW", "pt-BR"};
+                                                   "es-419", "nl", "ru", "ko", "zh-Hans", "zh-Hant", "pt-BR"};
 const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English (US)", "English (UK)", "French",
                                                    "French (Canada)", "German", "Italian", "Spanish",
                                                    "Spanish (Latin America)", "Dutch", "Russian", "Korean",
@@ -68,7 +70,7 @@ static const char *host_language(void) {
                                                              {"pt", "pt-BR"}};
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(l, map[i].loc)) return map[i].code;
-    if (!strcmp(l, "zh")) return e[n] == '_' && e[n + 1] == 'T' ? "zh-TW" : "zh-CN";  // (TW / HK: traditional)
+    if (!strcmp(l, "zh")) return e[n] == '_' && e[n + 1] == 'T' ? "zh-Hant" : "zh-Hans";  // (TW / HK: traditional)
     return "en-US";
 }
 
@@ -130,8 +132,10 @@ void settings_load(void) {
                                                               PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : PROMPTS_AUTO;
         else if (!strcmp(key, "language")) {  // ("auto" or one of the game's codes; anything else: auto)
             g_settings.language = LANG_AUTO;
+            // (settings files from before the Chinese fix say zh-CN / zh-TW)
+            const char *code = !strcmp(val, "zh-CN") ? "zh-Hans" : !strcmp(val, "zh-TW") ? "zh-Hant" : val;
             for (int i = 1; i < N_LANGUAGES; i++)
-                if (!strcmp(val, g_language_codes[i])) g_settings.language = i;
+                if (!strcmp(code, g_language_codes[i])) g_settings.language = i;
         }
         else if (!strcmp(key, "cheat_rupees")) g_settings.cheat_rupees = atoi(val) != 0;
         else if (!strcmp(key, "cheat_health")) g_settings.cheat_health = atoi(val) != 0;

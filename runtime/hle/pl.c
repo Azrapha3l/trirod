@@ -5,6 +5,10 @@
 //  3. a Japanese gothic like UD Shin Go (much closer to the game's look than Arial): Hiragino Sans W4 on macOS,
 //     Yu Gothic Regular / Medium on Windows
 //  4. Arial
+// Chinese and Korean text use their own shared font types (font_for), each found the same way: the console's font
+// from fonts/, then a Windows font with those glyphs, then Standard. Standard alone (a Japanese font) lacks the
+// simplified-only characters: in Simplified Chinese the file select showed 自'保存 / '除 / 要'取 for 自动保存 / 删除 /
+// 要读取 (2026-11-27, Yu Gothic).
 // .bfttf is the console's obfuscated TTF: 8-byte header (magic, size) then every u32 XORed with a fixed key.
 // .ttc collections get face 0 copied out as a standalone font (the game's font engine wants one sfnt).
 #include <stdlib.h>
@@ -15,7 +19,9 @@
 #include "../paths.h"
 
 typedef struct { uint64_t addr, size; } Font;
-static Font fonts[2];  // [0] Standard (every type), [1] NintendoExt when a dump provides it
+// By SharedFontType (0 Standard, 1 ChineseSimple, 2 ChineseSimpleExt, 3 ChineseTraditional, 4 Korean, 5 NintendoExt);
+// an empty one is served as Standard
+static Font fonts[6];
 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 static void put32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
@@ -126,13 +132,31 @@ static void load_fonts(void) {
     for (size_t i = 0; i < sizeof std / sizeof *std && !fonts[0].addr; i++)
         if (std[i]) load_one(std[i], &fonts[0]);
     if (!fonts[0].addr) FATAL("no usable system font substitute\n");
-    if (!load_one("fonts/nintendo_ext_003.bfttf", &fonts[1])) load_one("fonts/nintendo_ext_003.ttf", &fonts[1]);
+    // The other types: the console's file names (dumped by the player), then a Windows font with the same script
+    // (all TrueType outlines, which the game's engine needs: Microsoft YaHei, JhengHei, Malgun Gothic). Not found:
+    // Standard. ChineseSimpleExt is the extra simplified glyphs; YaHei has them, so it serves both Simple types.
+    static const char *const per_type[6][5] = {
+        [1] = {"fonts/nintendo_udsg-r_org_zh-cn_003.bfttf", "fonts/nintendo_udsg-r_org_zh-cn_003.ttf",
+               "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc"},
+        [2] = {"fonts/nintendo_udsg-r_ext_zh-cn_003.bfttf", "fonts/nintendo_udsg-r_ext_zh-cn_003.ttf",
+               "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc"},
+        [3] = {"fonts/nintendo_udjxh-db_zh-tw_003.bfttf", "fonts/nintendo_udjxh-db_zh-tw_003.ttf",
+               "C:/Windows/Fonts/msjh.ttc", "C:/Windows/Fonts/mingliu.ttc"},
+        [4] = {"fonts/nintendo_udsg-r_ko_003.bfttf", "fonts/nintendo_udsg-r_ko_003.ttf", "C:/Windows/Fonts/malgun.ttf"},
+        [5] = {"fonts/nintendo_ext_003.bfttf", "fonts/nintendo_ext_003.ttf"},
+    };
+    const char *from[6] = {0};  // the file each type was loaded from
+    for (int t = 1; t < 6; t++)
+        for (int i = 0; i < 5 && per_type[t][i] && !fonts[t].addr; i++) {
+            for (int u = 1; u < t; u++)  // (the same file for two types is loaded once: YaHei is 19 MB)
+                if (from[u] && !strcmp(from[u], per_type[t][i])) fonts[t] = fonts[u];
+            if (fonts[t].addr || load_one(per_type[t][i], &fonts[t])) from[t] = per_type[t][i];
+        }
 }
 
-// SharedFontType: 0 Standard, 1 ChineseSimple, 2 ChineseSimpleExt, 3 ChineseTraditional, 4 Korean, 5 NintendoExt
 static const Font *font_for(uint64_t type) {
     load_fonts();
-    return type == 5 && fonts[1].addr ? &fonts[1] : &fonts[0];
+    return type < 6 && fonts[type].addr ? &fonts[type] : &fonts[0];
 }
 
 HLE_FUNC("_ZN2nn2pl22GetSharedFontLoadStateENS0_14SharedFontTypeE", pl_get_load_state) { c->x[0] = 1; }

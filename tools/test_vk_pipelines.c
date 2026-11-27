@@ -16,6 +16,7 @@
 // ---- what shaders.c needs from the rest of the runtime
 VkG g_vk;
 void rt_fatal_trace(void) { abort(); }
+const char *vk_cache_dir(void) { return "build/test_vk_pipelines"; }  // (shaders.c's SPIR-V cache: a scratch folder)
 void vk_device_fault_report(void) {
     fprintf(stderr, "Vulkan device lost during pipeline test\n");
     abort();

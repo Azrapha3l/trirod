@@ -4767,6 +4767,37 @@ static void trace_draw(Prog *pr, CmdRec *r, bool indexed) {
         LOG("[trace]   indices %llx type %u count %u: %u..%u, base vertex %d\n", (unsigned long long)r->x[3], type, n, lo, hi,
             (int)(int64_t)r->x[4]);
     }
+    static int dump = -1;  // EOWRECOMP_VK_TRACE_DUMP=1: the traced draw's VS inputs as files, to replay it outside the game
+    if (dump < 0) dump = getenv("EOWRECOMP_VK_TRACE_DUMP") != NULL;
+    if (dump) {
+        mkdir("build", 0755);
+        mkdir("build/trace", 0755);
+        char path[160];
+        FILE *f;
+#define TRACE_DUMP(name, addr, size) do { \
+            snprintf(path, sizeof path, "build/trace/f%llu_d%u_%s.bin", (unsigned long long)diag_frame, diag_draw, name); \
+            if ((addr) && (size) && (f = fopen(path, "wb"))) { fwrite((const void *)(uintptr_t)(addr), 1, (size_t)(size), f); fclose(f); } \
+        } while (0)
+        NvnShaderStage *vss = &st.program->stages[0];
+        TRACE_DUMP("vs_c1", vss->code_addr + vss->const_offset, vss->const_size ? vss->const_size : 256);
+        for (int k = 3; k < 18; k++) {
+            if (!((pr->vi->cbuf_mask >> k) & 1)) continue;
+            char name[16];
+            snprintf(name, sizeof name, "vs_c%d", k);
+            TRACE_DUMP(name, st.ubuf[0][k - 3].addr, st.ubuf[0][k - 3].size);
+        }
+        for (int s = 0; s < 16 && s < st.nstream; s++) {
+            char name[16];
+            snprintf(name, sizeof name, "vbuf%d", s);
+            TRACE_DUMP(name, st.vbuf[s].addr, st.vbuf[s].size);
+        }
+        if (indexed) {
+            uint32_t type = (uint32_t)r->x[1];
+            TRACE_DUMP("indices", r->x[3], (uint64_t)r->x[2] * (type == 0 ? 1 : type == 1 ? 2 : 4));
+        }
+#undef TRACE_DUMP
+        LOG("[trace]   inputs dumped to build/trace/f%llu_d%u_*.bin\n", (unsigned long long)diag_frame, diag_draw);
+    }
     for (int i = 0; i < 32; i++) {  // the vertex attributes the VS reads: NVN format, stream, offset (draw_'s PipeKey)
         if (!(pr->vi->attr_mask & (1u << i))) continue;
         uint32_t a = i < st.nattrib ? st.attrib[i] : 0;
